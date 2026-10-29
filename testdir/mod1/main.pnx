@@ -1,0 +1,11 @@
+global :: 10;
+
+main :: fn () void {
+	x := global + 10;
+	x = x + 12;
+};
+
+func :: fn (arg0: u32, arg1: i32, arg2: f32) bool {
+	const :: 5;
+	x := arg0 + const + 1 + arg1;
+};
