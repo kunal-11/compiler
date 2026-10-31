@@ -1,5 +1,6 @@
 const stdx = @import("stdx.zig");
 const mem = stdx.mem;
+const debug = stdx.debug;
 
 const lexer = @import("lexer.zig");
 
@@ -7,7 +8,7 @@ const Context = @import("types.zig").Context;
 const File = @import("types.zig").File;
 const Ast = @import("types.zig").Ast;
 const InternPool = @import("types.zig").InternPool;
-const Intrinsic = @import("types.zig").Intrinsic;
+const TypeLit = @import("types.zig").TypeLit;
 
 const TokenCache = struct {
     buf: []const u8,
@@ -43,58 +44,6 @@ const TokenCache = struct {
     }
 };
 
-const min_bind_power: u32 = 0;
-fn opPrecedence(tag: lexer.Tag, prefix: bool) u32 {
-    return if (prefix) switch (tag) {
-        .minus => 4,
-        else => @panic("token not an prefix operator"),
-    } else switch (tag) {
-        .plus, .minus => 2,
-        .mul, .div, .mod => 3,
-        else => @panic("token not an infix or postfix operator"),
-    };
-}
-
-const State = struct {
-    arena: mem.Arena,
-    ctx: *Context,
-    file_id: File.Id,
-    ast: *Ast,
-    tokens: TokenCache,
-};
-
-const ParseError = error{ UnexpectedToken, IntrinsicShadowing };
-
-const max_file_decls = 2048;
-pub fn parseFile(ctx: *Context, file_id: File.Id) []Ast.NodeId {
-    const decls = ctx.arena.pushArray(Ast.NodeId, max_file_decls);
-    var decl_count: u32 = 0;
-
-    const flusher = mem.Flusher.init(&ctx.arena);
-    defer flusher.flush();
-
-    const file = ctx.getFile(file_id);
-    var state = State{
-        .ctx = ctx,
-        .file_id = file_id,
-        .ast = file.ast,
-        .arena = ctx.arena.subArena(8 * mem.MB),
-        .tokens = .{ .buf = file.contents },
-    };
-
-    while (state.tokens.peek().tag != .eof) {
-        decls[decl_count] = parseDecl(&state) catch {
-            skipStatement(&state);
-            if (state.tokens.peek().tag == .close_brace)
-                @panic("TODO: handle dangling close brace");
-            continue;
-        };
-        decl_count += 1;
-    }
-
-    return decls[0..decl_count];
-}
-
 fn skipStatement(state: *State) void {
     var opened_braces: u32 = 0;
     while (true) {
@@ -118,14 +67,79 @@ fn skipStatement(state: *State) void {
     }
 }
 
+const min_bind_power: u32 = 0;
+fn opPrecedence(tag: lexer.Tag, prefix: bool) u32 {
+    return if (prefix) switch (tag) {
+        .minus => 4,
+        else => @panic("token not an prefix operator"),
+    } else switch (tag) {
+        .plus, .minus => 2,
+        .mul, .div, .mod => 3,
+        else => @panic("token not an infix or postfix operator"),
+    };
+}
+
+const State = struct {
+    arena: mem.Arena,
+    ctx: *Context,
+    file_id: File.Id,
+    ast: *Ast,
+    tokens: TokenCache,
+};
+
+const ParseError = error{ UnexpectedToken, IntrinsicShadowing };
+
+const max_file_decls = 2048;
+pub fn parseFile(ctx: *Context, arena: *mem.Arena, file_id: File.Id) Ast.NodeId {
+    const flusher = mem.Flusher.init(arena);
+    defer flusher.flush();
+
+    const file = ctx.getFile(file_id);
+    var state = State{
+        .ctx = ctx,
+        .file_id = file_id,
+        .ast = file.ast,
+        .arena = arena.subArena(8 * mem.MB),
+        .tokens = .{ .buf = file.contents },
+    };
+
+    const decls = state.arena.pushArray(Ast.NodeId, max_file_decls);
+    var decl_count: u32 = 0;
+    while (state.tokens.peek().tag != .eof) {
+        decls[decl_count] = parseDecl(&state) catch {
+            skipStatement(&state);
+            const token = state.tokens.peek();
+            if (token.tag == .close_brace) {
+                state.ctx.addMsg(.{
+                    .pos = .{ .file = state.file_id, .offset = token.start },
+                    .severity = .err,
+                    .data = .{ .unexpected_token = .{
+                        .expected = .identifier,
+                        .found = token.tag,
+                    } },
+                });
+                state.tokens.advance();
+            }
+            continue;
+        };
+        decl_count += 1;
+    }
+
+    return state.ast.allocNode(.{
+        .pos = 0,
+        .tag = .file,
+        .data = .{ .block = decls[0..decl_count] },
+    });
+}
+
 fn parseDecl(state: *State) ParseError!Ast.NodeId {
     const identifier = try expect(state, .identifier);
     const str = state.tokens.str(identifier);
-    if (Intrinsic.fromStr(str)) |intrinsic| {
+    if (TypeLit.fromStr(str)) |type_lit| {
         state.ctx.addMsg(.{
             .severity = .err,
             .pos = .{ .file = state.file_id, .offset = identifier.start },
-            .data = .{ .name_shadows_intrinsic = .{ .found = intrinsic } },
+            .data = .{ .name_shadows_type = .{ .found = type_lit } },
         });
         return error.IntrinsicShadowing;
     }
@@ -282,11 +296,11 @@ fn parseFnType(state: *State) ParseError!Ast.NodeId {
 fn parseParam(state: *State) ParseError!Ast.NodeId {
     const identifier = try expect(state, .identifier);
     const str = state.tokens.str(identifier);
-    if (Intrinsic.fromStr(str)) |intrinsic| {
+    if (TypeLit.fromStr(str)) |type_lit| {
         state.ctx.addMsg(.{
             .severity = .err,
             .pos = .{ .file = state.file_id, .offset = identifier.start },
-            .data = .{ .name_shadows_intrinsic = .{ .found = intrinsic } },
+            .data = .{ .name_shadows_type = .{ .found = type_lit } },
         });
         return error.IntrinsicShadowing;
     }
@@ -309,8 +323,10 @@ fn parseExpression(state: *State, bind_power: u32) ParseError!Ast.NodeId {
     var result = switch (state.tokens.peek().tag) {
         .minus => try parseUnaryOp(state, bind_power),
         .key_fn => try parseFnTypeOrLiteral(state),
-        .num_literal => try parseNumLit(state),
         .identifier => try parseIdentifier(state),
+        .key_undefined => parseUndefLit(state),
+        .key_false, .key_true => parseBoolLit(state),
+        .num_literal => parseNumLit(state),
         else => @panic("TODO: handle other kinds of expressions"),
     };
 
@@ -394,8 +410,10 @@ fn parseFnTypeOrLiteral(state: *State) ParseError!Ast.NodeId {
     return type_node;
 }
 
-fn parseNumLit(state: *State) ParseError!Ast.NodeId {
-    const token = try expect(state, .num_literal);
+fn parseNumLit(state: *State) Ast.NodeId {
+    const token = state.tokens.peek();
+    debug.assert(token.tag == .num_literal, "parse invalid num literal");
+    state.tokens.advance();
     return state.ast.allocNode(.{
         .pos = token.start,
         .tag = .num_lit,
@@ -403,14 +421,36 @@ fn parseNumLit(state: *State) ParseError!Ast.NodeId {
     });
 }
 
+fn parseUndefLit(state: *State) Ast.NodeId {
+    const token = state.tokens.peek();
+    debug.assert(token.tag == .key_undefined, "parse invalid undef literal");
+    state.tokens.advance();
+    return state.ast.allocNode(.{
+        .pos = token.start,
+        .tag = .undef_lit,
+        .data = .{ .empty = {} },
+    });
+}
+
+fn parseBoolLit(state: *State) Ast.NodeId {
+    const token = state.tokens.peek();
+    debug.assert(token.tag == .key_false or token.tag == .key_true, "parse invalid bool lit");
+    state.tokens.advance();
+    return state.ast.allocNode(.{
+        .pos = token.start,
+        .tag = .bool_lit,
+        .data = .{ .bool_lit = token.tag == .key_true },
+    });
+}
+
 fn parseIdentifier(state: *State) ParseError!Ast.NodeId {
     const token = try expect(state, .identifier);
     const str = state.tokens.str(token);
-    if (Intrinsic.fromStr(str)) |intrinsic| {
+    if (TypeLit.fromStr(str)) |type_lit| {
         return state.ast.allocNode(.{
             .pos = token.start,
-            .tag = .intrinsic,
-            .data = .{ .intrinsic = intrinsic },
+            .tag = .type_lit,
+            .data = .{ .type_lit = type_lit },
         });
     }
     const intern_id = state.ctx.intern_pool.getOrCreateId(str);

@@ -7,7 +7,13 @@ pub const Tag = enum {
     invalid,
 
     identifier,
+
     key_fn,
+
+    key_true,
+    key_false,
+
+    key_undefined,
 
     num_literal,
 
@@ -120,10 +126,16 @@ pub fn lexToken(buf: []const u8, pos: u32) Token {
 
 fn parseWordToken(buf: []const u8, start: u32, end: u32) Token {
     const word = buf[start..end];
-    var tag = Tag.identifier;
-    if (mem.eql(word, "fn")) {
-        tag = .key_fn;
-    }
+    const tag: Tag = if (mem.eql(word, "fn"))
+        .key_fn
+    else if (mem.eql(word, "true"))
+        .key_true
+    else if (mem.eql(word, "false"))
+        .key_false
+    else if (mem.eql(word, "undefined"))
+        .key_undefined
+    else
+        .identifier;
     return .{
         .tag = tag,
         .start = start,

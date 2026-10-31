@@ -1,6 +1,8 @@
 global :: 10;
 
 main :: fn () void {
+	z := undefined;
+	b := true;
 	x := global + 10;
 	x = x + 12;
 };

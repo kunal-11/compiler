@@ -5,10 +5,12 @@ const Ast = @import("types.zig").Ast;
 const Context = @import("types.zig").Context;
 const File = @import("types.zig").File;
 const UntypedIr = @import("types.zig").UntypedIr;
+const InternPool = @import("types.zig").InternPool;
 
 const lexer = @import("lexer.zig");
 
 pub fn debugPrintMessages(ctx: *Context) void {
+    debug.print("Messages:\n", .{});
     if (ctx.msg_count == 0) return;
     for (ctx.msgs[0..ctx.msg_count], 0..) |msg, id| {
         debug.print("{} {}\n", .{ id + 1, msg });
@@ -16,7 +18,12 @@ pub fn debugPrintMessages(ctx: *Context) void {
 }
 
 const ir_indent = "    ";
-pub fn debugPrintIr(file: []const u8, ir: *UntypedIr, inst_id: UntypedIr.InstId, indent: u32) void {
+pub fn debugPrintIr(
+    file: []const u8,
+    ir: *UntypedIr,
+    inst_id: UntypedIr.InstId,
+    indent: u32,
+) void {
     const inst = ir.getInst(inst_id);
 
     for (0..indent) |_| {
@@ -24,10 +31,13 @@ pub fn debugPrintIr(file: []const u8, ir: *UntypedIr, inst_id: UntypedIr.InstId,
     }
 
     switch (inst.tag) {
-        .block => {
-            debug.print("%{} = block {{\n", .{@backingInt(inst_id)});
+        .block, .comp_block => {
+            debug.print("%{} = {s} {{\n", .{ @backingInt(inst_id), @tagName(inst.tag) });
             for (inst.data.block) |child_inst| {
                 debugPrintIr(file, ir, child_inst, indent + 1);
+            }
+            for (0..indent) |_| {
+                debug.print("{s}", .{ir_indent});
             }
             debug.print("}}\n", .{});
         },
@@ -48,33 +58,30 @@ pub fn debugPrintIr(file: []const u8, ir: *UntypedIr, inst_id: UntypedIr.InstId,
             for (inst.data.fn_lit.body) |child_inst| {
                 debugPrintIr(file, ir, child_inst, indent + 1);
             }
-            debug.print("{s}}}\n", .{ir_indent});
+            for (0..indent) |_| {
+                debug.print("{s}", .{ir_indent});
+            }
+            debug.print("}}\n", .{});
         },
 
         .fn_arg => {
-            debug.print("%{} = {s} #{}\n", .{
+            const token = lexer.lexToken(file, inst.pos);
+            const str = file[token.start..token.end];
+            debug.print("%{} = {s} #{} \"{s}\"\n", .{
                 @backingInt(inst_id),
                 @tagName(inst.tag),
                 inst.data.fn_arg.index,
+                str,
             });
         },
 
-        .num_lit, .intrinsic, .identifier => {
+        .num_lit, .type_lit, .bool_lit, .undef_lit, .identifier, .reserved => {
             const token = lexer.lexToken(file, inst.pos);
             const str = file[token.start..token.end];
             debug.print("%{} = {s} #{s}\n", .{ @backingInt(inst_id), @tagName(inst.tag), str });
         },
 
-        .alloc_const, .alloc_var => {
-            debug.print("%{} = {s} %{} = %{}\n", .{
-                @backingInt(inst_id),
-                @tagName(inst.tag),
-                @backingInt(inst.data.decl.type),
-                @backingInt(inst.data.decl.value),
-            });
-        },
-
-        .add, .subtract, .mul, .div, .mod, .assign => {
+        .add, .subtract, .mul, .div, .mod, .assign, .alloc, .store, .brk, .ret => {
             debug.print("%{} = {s} %{} %{}\n", .{
                 @backingInt(inst_id),
                 @tagName(inst.tag),
@@ -82,7 +89,7 @@ pub fn debugPrintIr(file: []const u8, ir: *UntypedIr, inst_id: UntypedIr.InstId,
                 @backingInt(inst.data.bin_op.rhs),
             });
         },
-        .negate => {
+        .type_of, .load, .negate, .brk_implicit, .ret_implicit => {
             debug.print("%{} = {s} %{}\n", .{
                 @backingInt(inst_id),
                 @tagName(inst.tag),
@@ -122,7 +129,12 @@ pub fn debugPrintAst(
     debug.print("{s}{s}{s} {s}\n", .{ prefix, self_fmt, @tagName(node.tag), token_str });
 
     switch (node.tag) {
-        .identifier, .intrinsic, .num_lit => {},
+        .file, .block, .params => {
+            const block = node.data.block;
+            for (block, 0..) |id, idx| {
+                debugPrintAst(file, ast, id, child_len, idx == block.len - 1);
+            }
+        },
 
         .fn_type => {
             debugPrintAst(file, ast, node.data.fn_type.args, child_len, false);
@@ -132,12 +144,7 @@ pub fn debugPrintAst(
             debugPrintAst(file, ast, node.data.fn_lit.fn_type, child_len, false);
             debugPrintAst(file, ast, node.data.fn_lit.block, child_len, true);
         },
-        .block, .params => {
-            const block = node.data.block;
-            for (block, 0..) |id, idx| {
-                debugPrintAst(file, ast, id, child_len, idx == block.len - 1);
-            }
-        },
+
         .param => if (node.data.param.type != .none) {
             debugPrintAst(file, ast, node.data.param.type, child_len, true);
         },
@@ -152,5 +159,7 @@ pub fn debugPrintAst(
             debugPrintAst(file, ast, node.data.bin_op.lhs, child_len, false);
             debugPrintAst(file, ast, node.data.bin_op.rhs, child_len, true);
         },
+
+        .identifier, .type_lit, .bool_lit, .undef_lit, .num_lit => {},
     }
 }
