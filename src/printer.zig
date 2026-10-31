@@ -75,7 +75,7 @@ pub fn debugPrintIr(
             });
         },
 
-        .num_lit, .type_lit, .bool_lit, .undef_lit, .identifier, .reserved => {
+        .num_lit, .type_lit, .bool_lit, .undef_lit, .reserved, .global_ref => {
             const token = lexer.lexToken(file, inst.pos);
             const str = file[token.start..token.end];
             debug.print("%{} = {s} #{s}\n", .{ @backingInt(inst_id), @tagName(inst.tag), str });

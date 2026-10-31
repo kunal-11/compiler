@@ -457,6 +457,8 @@ pub const UntypedIr = struct {
 
         type_of,
 
+        global_ref,
+
         type_lit,
         num_lit,
         bool_lit,
@@ -466,7 +468,6 @@ pub const UntypedIr = struct {
         store,
         load,
 
-        identifier,
         fn_lit,
         fn_arg,
         fn_type,
@@ -490,6 +491,8 @@ pub const UntypedIr = struct {
 
             type_lit: TypeLit,
             bool_lit: bool,
+
+            global_ref: InternPool.Id,
 
             fn_arg: struct { index: u32 },
             fn_lit: struct { type: InstId, body: []InstId },
@@ -523,7 +526,14 @@ pub const UntypedIr = struct {
                 };
             },
 
-            .reserved, .num_lit, .undef_lit, .identifier => .{
+            .global_ref => .{
+                .pos = inst.pos,
+                .tag = inst.tag,
+                .lhs = @backingInt(inst.data.global_ref),
+                .rhs = 0,
+            },
+
+            .reserved, .num_lit, .undef_lit => .{
                 .pos = inst.pos,
                 .tag = inst.tag,
                 .lhs = 0,
@@ -607,7 +617,9 @@ pub const UntypedIr = struct {
                     break :blk .{ .block = first_inst[0..inst.rhs] };
                 },
 
-                .reserved, .num_lit, .identifier, .undef_lit => .{ .empty = {} },
+                .global_ref => .{ .global_ref = @fromBackingInt(inst.lhs) },
+
+                .reserved, .num_lit, .undef_lit => .{ .empty = {} },
                 .bool_lit => .{ .bool_lit = inst.lhs == 1 },
                 .type_lit => .{ .type_lit = @fromBackingInt(inst.lhs) },
 

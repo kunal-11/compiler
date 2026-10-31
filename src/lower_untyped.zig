@@ -13,7 +13,8 @@ const State = struct {
     const max_blocks = 128;
 
     const Block = struct {
-        marker: u32,
+        inst_marker: u32,
+        undo_marker: u32,
         reserved_id: Ir.InstId,
         tag: enum { any, function, compile },
     };
@@ -24,6 +25,7 @@ const State = struct {
     };
 
     arena: mem.Arena,
+    ctx: *Context,
     ast: *Ast,
     ir: *Ir,
 
@@ -36,6 +38,8 @@ const State = struct {
     phases: [max_blocks]Phase = undefined,
     phase_count: u32 = 0,
 
+    name_table: NameTable = .{},
+
     pub fn emit(state: *State, inst: Ir.Inst) Ir.InstId {
         const inst_id = state.ir.allocInst(inst);
         state.insts[state.inst_count] = inst_id;
@@ -45,7 +49,8 @@ const State = struct {
 
     pub fn beginBlock(state: *State) void {
         state.blocks[state.block_count] = .{
-            .marker = state.inst_count,
+            .inst_marker = state.inst_count,
+            .undo_marker = state.name_table.undo_len,
             .tag = .any,
             .reserved_id = state.ir.allocInst(.{
                 .tag = .reserved,
@@ -58,7 +63,8 @@ const State = struct {
 
     pub fn beginFnBlock(state: *State, type_inst: Ir.InstId) void {
         state.blocks[state.block_count] = .{
-            .marker = state.inst_count,
+            .undo_marker = state.name_table.undo_len,
+            .inst_marker = state.inst_count,
             .tag = .function,
             .reserved_id = state.ir.allocInst(.{
                 .tag = .reserved,
@@ -69,6 +75,7 @@ const State = struct {
         state.block_count += 1;
         state.phases[state.phase_count] = .{ .function = type_inst };
         state.phase_count += 1;
+        state.name_table.fn_depth += 1;
     }
 
     pub fn beginCompileBlock(state: *State) void {
@@ -86,7 +93,8 @@ const State = struct {
         }
 
         state.blocks[state.block_count] = .{
-            .marker = state.inst_count,
+            .undo_marker = state.name_table.undo_len,
+            .inst_marker = state.inst_count,
             .tag = .compile,
             .reserved_id = block_id,
         };
@@ -105,6 +113,10 @@ const State = struct {
 
         if (block.tag == .compile or block.tag == .function) {
             state.phase_count -= 1;
+        }
+
+        if (block.tag == .function) {
+            state.name_table.fn_depth -= 1;
         }
 
         debug.assert(block.reserved_id != .none, "block reserved id invalid");
@@ -137,8 +149,10 @@ const State = struct {
             },
         }
 
-        const insts = state.insts[block.marker..state.inst_count];
-        state.inst_count = block.marker;
+        state.name_table.undo(block.undo_marker);
+
+        const insts = state.insts[block.inst_marker..state.inst_count];
+        state.inst_count = block.inst_marker;
 
         const inst: Ir.Inst = switch (block.tag) {
             .any => .{
@@ -165,6 +179,107 @@ const State = struct {
     }
 };
 
+const Name = struct {
+    intern_id: InternPool.Id,
+    inst: Ir.InstId,
+    tag: enum { arg, constant, variable },
+};
+
+const NameTable = struct {
+    const max_names = 8192;
+
+    const Item = struct {
+        name: Name,
+        fn_depth: u16,
+    };
+
+    names: [max_names]Item = @splat(.{
+        .name = .{
+            .intern_id = .none,
+            .inst = .none,
+            .tag = undefined,
+        },
+        .fn_depth = undefined,
+    }),
+
+    // hack: inst is set to none for deletion entries
+    undo_stack: [max_names]Item = undefined,
+    undo_len: u32 = 0,
+
+    fn_depth: u16 = 0,
+
+    const max_probes = max_names / 4;
+    fn getSlot(table: *NameTable, id: InternPool.Id) *Item {
+        debug.assert(id != .none, "name table slot for none");
+
+        const hash = @backingInt(id) % max_names;
+        var probe: u32 = 0;
+        while (probe < max_probes) : (probe += 1) {
+            const slot = table.names[(hash + probe) % max_names];
+            if (slot.name.intern_id == .none or slot.name.intern_id == id) break;
+        }
+
+        debug.assert(probe < max_probes, "name table OOM");
+        return &table.names[(hash + probe) % max_names];
+    }
+
+    // shadowing rule
+    fn shadowAllowed(table: *NameTable, item: Item) bool {
+        debug.assert(item.name.intern_id != .none, "");
+        return (item.name.tag == .variable or item.name.tag == .arg) and
+            item.fn_depth < table.fn_depth;
+    }
+
+    // returns the existing name if redecl, caller to check and emit error
+    pub fn pushName(table: *NameTable, name: Name) Name {
+        const slot = table.getSlot(name.intern_id);
+
+        if (slot.name.intern_id != .none and !table.shadowAllowed(slot.*)) {
+            return slot.name;
+        }
+
+        table.undo_stack[table.undo_len] = .{
+            .name = .{
+                .intern_id = name.intern_id,
+                .inst = slot.name.inst,
+                .tag = slot.name.tag,
+            },
+            .fn_depth = slot.fn_depth,
+        };
+        table.undo_len += 1;
+
+        slot.* = .{
+            .name = name,
+            .fn_depth = table.fn_depth,
+        };
+        return name;
+    }
+
+    pub fn findName(table: *NameTable, id: InternPool.Id) ?Name {
+        debug.assert(id != .none, "");
+        const slot = table.getSlot(id);
+
+        if (slot.name.intern_id == .none or
+            ((slot.name.tag == .variable or slot.name.tag == .arg) and
+                slot.fn_depth < table.fn_depth))
+            return null;
+
+        debug.assert(slot.name.intern_id == id, "");
+        return slot.name;
+    }
+
+    pub fn undo(table: *NameTable, marker: u32) void {
+        while (table.undo_len > marker) : (table.undo_len -= 1) {
+            var item = table.undo_stack[table.undo_len - 1];
+            const slot = table.getSlot(item.name.intern_id);
+            if (item.name.inst == .none) {
+                item.name.intern_id = .none;
+            }
+            slot.* = item;
+        }
+    }
+};
+
 pub const Decl = struct {
     pos: u32,
     name: InternPool.Id,
@@ -181,8 +296,10 @@ pub fn lowerFile(ctx: *Context, arena: *mem.Arena, file_id: File.Id, root_id: As
     defer flusher.flush();
 
     const file = ctx.getFile(file_id);
-    var state = State{
+    var state = arena.pushStruct(State);
+    state.* = .{
         .arena = arena.subArena(1 * mem.MB),
+        .ctx = ctx,
         .ast = file.ast,
         .ir = file.untyped_ir,
     };
@@ -196,13 +313,13 @@ pub fn lowerFile(ctx: *Context, arena: *mem.Arena, file_id: File.Id, root_id: As
 
         const type_inst = if (param_node.data.param.type != .none) blk: {
             state.beginCompileBlock();
-            const res = lower(&state, param_node.data.param.type);
+            const res = lower(state, param_node.data.param.type);
             break :blk state.emitBlock(param_node.pos, res);
         } else .none;
 
         const value_node = state.ast.getNode(decl_node.data.decl.value);
         state.beginCompileBlock();
-        const res = lower(&state, decl_node.data.decl.value);
+        const res = lower(state, decl_node.data.decl.value);
         const value_inst = state.emitBlock(value_node.pos, res);
 
         result[result_count] = .{
@@ -215,6 +332,29 @@ pub fn lowerFile(ctx: *Context, arena: *mem.Arena, file_id: File.Id, root_id: As
     }
 
     return result[0..result_count];
+}
+
+fn lowerPtr(state: *State, node_id: Ast.NodeId) Ir.InstId {
+    const node = state.ast.getNode(node_id);
+    return switch (node.tag) {
+        .identifier => blk: {
+            const id = node.data.identifier.intern_id;
+            if (state.name_table.findName(id)) |name| {
+                const inst = switch (name.tag) {
+                    .constant, .arg => @panic("TODO: handle invalid lvalue error"),
+                    .variable => name.inst,
+                };
+                break :blk inst;
+            } else {
+                break :blk state.emit(.{
+                    .pos = node.pos,
+                    .tag = .global_ref,
+                    .data = .{ .global_ref = id },
+                });
+            }
+        },
+        else => @panic("TODO: handle invalid lvalue error"),
+    };
 }
 
 const max_fn_args = 1024;
@@ -251,29 +391,35 @@ fn lower(state: *State, node_id: Ast.NodeId) Ir.InstId {
         }),
 
         .fn_lit => blk: {
-            const type_node = state.ast.getNode(node.data.fn_lit.fn_type);
-            const type_inst = blk1: {
-                state.beginCompileBlock();
-                const res = lower(state, node.data.fn_lit.fn_type);
-                break :blk1 state.emitBlock(type_node.pos, res);
-            };
+            state.beginCompileBlock();
+            const type_inst = lower(state, node.data.fn_lit.fn_type);
 
             state.beginFnBlock(type_inst);
+            const type_node = state.ast.getNode(node.data.fn_lit.fn_type);
             const args = state.ast.getNode(type_node.data.fn_type.args).data.block;
             for (args, 0..) |arg, i| {
                 const arg_node = state.ast.getNode(arg);
-                // TODO: add the args for name resolution
-                _ = state.emit(.{
+                const inst = state.emit(.{
                     .pos = arg_node.pos,
                     .tag = .fn_arg,
                     .data = .{ .fn_arg = .{ .index = @intCast(i) } },
                 });
+                const name_ok = state.name_table.pushName(.{
+                    .intern_id = arg_node.data.param.intern_id,
+                    .inst = inst,
+                    .tag = .arg,
+                });
+                if (name_ok.inst != inst) {
+                    // TODO: emit error
+                    debug.log("TODO: redecl error", .{});
+                }
             }
             const body_nodes = state.ast.getNode(node.data.fn_lit.block).data.block;
             for (body_nodes) |body_node| {
                 _ = lower(state, body_node);
             }
-            break :blk state.emitBlock(node.pos, .none);
+            const res = state.emitBlock(node.pos, .none);
+            break :blk state.emitBlock(type_node.pos, res);
         },
         .fn_type => blk: {
             const flusher = mem.Flusher.init(&state.arena);
@@ -288,8 +434,6 @@ fn lower(state: *State, node_id: Ast.NodeId) Ir.InstId {
                 const arg_node = state.ast.getNode(arg);
                 arg_buf[arg_count] = lower(state, arg_node.data.param.type);
                 arg_count += 1;
-
-                // TODO: add the args for name resolution
             }
 
             const return_type = lower(state, node.data.fn_type.return_type);
@@ -305,16 +449,26 @@ fn lower(state: *State, node_id: Ast.NodeId) Ir.InstId {
         },
 
         .const_decl => blk: {
-            // TODO: add the param decl to name resolution
-            const param = state.ast.getNode(node.data.decl.param);
-            if (param.data.param.type != .none) {
+            const param = state.ast.getNode(node.data.decl.param).data.param;
+            if (param.type != .none) {
                 @panic("TODO: explicitly typed local constants");
             }
 
             state.beginCompileBlock();
             const value_node = state.ast.getNode(node.data.decl.value);
             const res = lower(state, node.data.decl.value);
-            break :blk state.emitBlock(value_node.pos, res);
+            const inst = state.emitBlock(value_node.pos, res);
+
+            const name_ok = state.name_table.pushName(.{
+                .intern_id = param.intern_id,
+                .inst = inst,
+                .tag = .constant,
+            });
+            if (name_ok.inst != inst) {
+                // TODO: emit error
+                debug.log("TODO: redecl error", .{});
+            }
+            break :blk inst;
         },
         .var_decl => blk: {
             const value_inst = lower(state, node.data.decl.value);
@@ -336,20 +490,57 @@ fn lower(state: *State, node_id: Ast.NodeId) Ir.InstId {
                 .data = .{ .bin_op = .{ .lhs = type_inst, .rhs = value_inst } },
             });
 
-            // TODO: add the param decl to name resolution
+            const name_ok = state.name_table.pushName(.{
+                .intern_id = param.data.param.intern_id,
+                .inst = inst,
+                .tag = .variable,
+            });
+            if (name_ok.inst != inst) {
+                // TODO: emit error
+                debug.log("TODO: redecl error", .{});
+            }
             break :blk inst;
         },
         .identifier => blk: {
-            // TODO: resolve the name of the identifier
-            const inst = state.emit(.{
-                .pos = node.pos,
-                .tag = .identifier,
-                .data = .{ .empty = {} },
-            });
-            break :blk inst;
+            const id = node.data.identifier.intern_id;
+            if (state.name_table.findName(id)) |name| {
+                const inst = switch (name.tag) {
+                    .constant, .arg => name.inst,
+                    .variable => state.emit(.{
+                        .pos = node.pos,
+                        .tag = .load,
+                        .data = .{ .unary_op = name.inst },
+                    }),
+                };
+                break :blk inst;
+            } else {
+                const ptr = state.emit(.{
+                    .pos = node.pos,
+                    .tag = .global_ref,
+                    .data = .{ .global_ref = id },
+                });
+                break :blk state.emit(.{
+                    .pos = node.pos,
+                    .tag = .load,
+                    .data = .{ .unary_op = ptr },
+                });
+            }
         },
 
-        .add, .subtract, .mul, .div, .mod, .assign => blk: {
+        .assign => blk: {
+            const lvalue = lowerPtr(state, node.data.bin_op.lhs);
+            const rvalue = lower(state, node.data.bin_op.rhs);
+            break :blk state.emit(.{
+                .pos = node.pos,
+                .tag = .store,
+                .data = .{ .bin_op = .{
+                    .lhs = lvalue,
+                    .rhs = rvalue,
+                } },
+            });
+        },
+
+        .add, .subtract, .mul, .div, .mod => blk: {
             const lhs = lower(state, node.data.bin_op.lhs);
             const rhs = lower(state, node.data.bin_op.rhs);
             break :blk state.emit(.{
@@ -360,8 +551,7 @@ fn lower(state: *State, node_id: Ast.NodeId) Ir.InstId {
                     .mul => .mul,
                     .div => .div,
                     .mod => .mod,
-                    .assign => .assign,
-                    else => @panic("lower bin op table incomplete"),
+                    else => @panic("lower binary op table incomplete"),
                 },
                 .data = .{ .bin_op = .{
                     .lhs = lhs,
