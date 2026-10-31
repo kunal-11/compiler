@@ -59,6 +59,8 @@ const State = struct {
             }),
         };
         state.block_count += 1;
+
+        state.name_table.lexical_depth += 1;
     }
 
     pub fn beginFnBlock(state: *State, type_inst: Ir.InstId) void {
@@ -75,7 +77,9 @@ const State = struct {
         state.block_count += 1;
         state.phases[state.phase_count] = .{ .function = type_inst };
         state.phase_count += 1;
+
         state.name_table.fn_depth += 1;
+        state.name_table.lexical_depth += 1;
     }
 
     pub fn beginCompileBlock(state: *State) void {
@@ -92,6 +96,8 @@ const State = struct {
             });
         }
 
+        state.name_table.lexical_depth += 1;
+
         state.blocks[state.block_count] = .{
             .undo_marker = state.name_table.undo_len,
             .inst_marker = state.inst_count,
@@ -105,18 +111,20 @@ const State = struct {
         const block = state.blocks[state.block_count - 1];
         state.block_count -= 1;
 
-        var phase = &state.phases[state.phase_count - 1];
+        state.name_table.undo(block.undo_marker);
+        if (block.tag == .function) {
+            state.name_table.fn_depth -= 1;
+        }
+        state.name_table.lexical_depth -= 1;
+
+        const phase = state.phases[state.phase_count - 1];
         if (block.tag == .compile and phase.compile > 1) {
-            phase.compile -= 1;
+            state.phases[state.phase_count - 1].compile -= 1;
             return result;
         }
 
         if (block.tag == .compile or block.tag == .function) {
             state.phase_count -= 1;
-        }
-
-        if (block.tag == .function) {
-            state.name_table.fn_depth -= 1;
         }
 
         debug.assert(block.reserved_id != .none, "block reserved id invalid");
@@ -148,8 +156,6 @@ const State = struct {
                 });
             },
         }
-
-        state.name_table.undo(block.undo_marker);
 
         const insts = state.insts[block.inst_marker..state.inst_count];
         state.inst_count = block.inst_marker;
@@ -191,6 +197,7 @@ const NameTable = struct {
     const Item = struct {
         name: Name,
         fn_depth: u16,
+        lexical_depth: u16,
     };
 
     names: [max_names]Item = @splat(.{
@@ -200,6 +207,7 @@ const NameTable = struct {
             .tag = undefined,
         },
         .fn_depth = undefined,
+        .lexical_depth = undefined,
     }),
 
     // hack: inst is set to none for deletion entries
@@ -207,6 +215,7 @@ const NameTable = struct {
     undo_len: u32 = 0,
 
     fn_depth: u16 = 0,
+    lexical_depth: u16 = 0,
 
     const max_probes = max_names / 4;
     fn getSlot(table: *NameTable, id: InternPool.Id) *Item {
@@ -223,19 +232,18 @@ const NameTable = struct {
         return &table.names[(hash + probe) % max_names];
     }
 
-    // shadowing rule
-    fn shadowAllowed(table: *NameTable, item: Item) bool {
-        debug.assert(item.name.intern_id != .none, "");
-        return (item.name.tag == .variable or item.name.tag == .arg) and
-            item.fn_depth < table.fn_depth;
-    }
+    pub const AddResult = union(enum) {
+        success,
+        redeclared: Name,
+    };
 
     // returns the existing name if redecl, caller to check and emit error
-    pub fn pushName(table: *NameTable, name: Name) Name {
+    pub fn addName(table: *NameTable, name: Name) AddResult {
         const slot = table.getSlot(name.intern_id);
 
-        if (slot.name.intern_id != .none and !table.shadowAllowed(slot.*)) {
-            return slot.name;
+        // shadowing rule
+        if (slot.name.intern_id != .none) {
+            return .{ .redeclared = slot.name };
         }
 
         table.undo_stack[table.undo_len] = .{
@@ -245,27 +253,40 @@ const NameTable = struct {
                 .tag = slot.name.tag,
             },
             .fn_depth = slot.fn_depth,
+            .lexical_depth = slot.lexical_depth,
         };
         table.undo_len += 1;
 
         slot.* = .{
             .name = name,
             .fn_depth = table.fn_depth,
+            .lexical_depth = table.lexical_depth,
         };
-        return name;
+        return .success;
     }
 
-    pub fn findName(table: *NameTable, id: InternPool.Id) ?Name {
+    pub const FindResult = union(enum) {
+        empty,
+        closure: Name,
+        success: Name,
+    };
+
+    pub fn findName(table: *NameTable, id: InternPool.Id) FindResult {
         debug.assert(id != .none, "");
         const slot = table.getSlot(id);
 
-        if (slot.name.intern_id == .none or
-            ((slot.name.tag == .variable or slot.name.tag == .arg) and
-                slot.fn_depth < table.fn_depth))
-            return null;
+        if (slot.name.intern_id == .none) return .empty;
 
         debug.assert(slot.name.intern_id == id, "");
-        return slot.name;
+
+        // check for closures, 0 is global scope which is allowed for global vars
+        // other enclosing function mutables or args not allowed
+        if (slot.fn_depth > 0 and slot.fn_depth < table.fn_depth) {
+            if (slot.name.tag == .variable or slot.name.tag == .arg)
+                return .{ .closure = slot.name };
+        }
+
+        return .{ .success = slot.name };
     }
 
     pub fn undo(table: *NameTable, marker: u32) void {
@@ -285,6 +306,7 @@ pub const Decl = struct {
     name: InternPool.Id,
     type: Ir.InstId,
     value: Ir.InstId,
+    tag: enum { var_decl, const_decl },
 };
 
 const max_decls = 1024;
@@ -296,7 +318,7 @@ pub fn lowerFile(ctx: *Context, arena: *mem.Arena, file_id: File.Id, root_id: As
     defer flusher.flush();
 
     const file = ctx.getFile(file_id);
-    var state = arena.pushStruct(State);
+    const state = arena.pushStruct(State);
     state.* = .{
         .arena = arena.subArena(1 * mem.MB),
         .ctx = ctx,
@@ -327,6 +349,11 @@ pub fn lowerFile(ctx: *Context, arena: *mem.Arena, file_id: File.Id, root_id: As
             .name = param_node.data.param.intern_id,
             .type = type_inst,
             .value = value_inst,
+            .tag = switch (decl_node.tag) {
+                .var_decl => .var_decl,
+                .const_decl => .const_decl,
+                else => @panic("unkown global node lowered"),
+            },
         };
         result_count += 1;
     }
@@ -339,21 +366,25 @@ fn lowerPtr(state: *State, node_id: Ast.NodeId) Ir.InstId {
     return switch (node.tag) {
         .identifier => blk: {
             const id = node.data.identifier.intern_id;
-            if (state.name_table.findName(id)) |name| {
-                const inst = switch (name.tag) {
-                    .constant, .arg => @panic("TODO: handle invalid lvalue error"),
-                    .variable => name.inst,
-                };
-                break :blk inst;
-            } else {
-                break :blk state.emit(.{
-                    .pos = node.pos,
-                    .tag = .global_ref,
-                    .data = .{ .global_ref = id },
-                });
+            switch (state.name_table.findName(id)) {
+                .closure => @panic("TODO: closure error"),
+                .empty => {
+                    break :blk state.emit(.{
+                        .pos = node.pos,
+                        .tag = .global_ref,
+                        .data = .{ .global_ref = id },
+                    });
+                },
+                .success => |name| {
+                    const inst = switch (name.tag) {
+                        .constant, .arg => @panic("TODO: invalid lvalue error"),
+                        .variable => name.inst,
+                    };
+                    break :blk inst;
+                },
             }
         },
-        else => @panic("TODO: handle invalid lvalue error"),
+        else => @panic("TODO: invalid lvalue error"),
     };
 }
 
@@ -404,14 +435,15 @@ fn lower(state: *State, node_id: Ast.NodeId) Ir.InstId {
                     .tag = .fn_arg,
                     .data = .{ .fn_arg = .{ .index = @intCast(i) } },
                 });
-                const name_ok = state.name_table.pushName(.{
+
+                const name = Name{
                     .intern_id = arg_node.data.param.intern_id,
                     .inst = inst,
                     .tag = .arg,
-                });
-                if (name_ok.inst != inst) {
-                    // TODO: emit error
-                    debug.log("TODO: redecl error", .{});
+                };
+                switch (state.name_table.addName(name)) {
+                    .redeclared => debug.log("TODO: redecl error", .{}),
+                    .success => {},
                 }
             }
             const body_nodes = state.ast.getNode(node.data.fn_lit.block).data.block;
@@ -459,14 +491,14 @@ fn lower(state: *State, node_id: Ast.NodeId) Ir.InstId {
             const res = lower(state, node.data.decl.value);
             const inst = state.emitBlock(value_node.pos, res);
 
-            const name_ok = state.name_table.pushName(.{
+            const name = Name{
                 .intern_id = param.intern_id,
                 .inst = inst,
                 .tag = .constant,
-            });
-            if (name_ok.inst != inst) {
-                // TODO: emit error
-                debug.log("TODO: redecl error", .{});
+            };
+            switch (state.name_table.addName(name)) {
+                .redeclared => debug.log("TODO: redecl error", .{}),
+                .success => {},
             }
             break :blk inst;
         },
@@ -490,40 +522,44 @@ fn lower(state: *State, node_id: Ast.NodeId) Ir.InstId {
                 .data = .{ .bin_op = .{ .lhs = type_inst, .rhs = value_inst } },
             });
 
-            const name_ok = state.name_table.pushName(.{
+            const name = Name{
                 .intern_id = param.data.param.intern_id,
                 .inst = inst,
                 .tag = .variable,
-            });
-            if (name_ok.inst != inst) {
-                // TODO: emit error
-                debug.log("TODO: redecl error", .{});
+            };
+            switch (state.name_table.addName(name)) {
+                .redeclared => debug.log("TODO: redecl error", .{}),
+                .success => {},
             }
             break :blk inst;
         },
         .identifier => blk: {
             const id = node.data.identifier.intern_id;
-            if (state.name_table.findName(id)) |name| {
-                const inst = switch (name.tag) {
-                    .constant, .arg => name.inst,
-                    .variable => state.emit(.{
+            switch (state.name_table.findName(id)) {
+                .empty => {
+                    const ptr = state.emit(.{
+                        .pos = node.pos,
+                        .tag = .global_ref,
+                        .data = .{ .global_ref = id },
+                    });
+                    break :blk state.emit(.{
                         .pos = node.pos,
                         .tag = .load,
-                        .data = .{ .unary_op = name.inst },
-                    }),
-                };
-                break :blk inst;
-            } else {
-                const ptr = state.emit(.{
-                    .pos = node.pos,
-                    .tag = .global_ref,
-                    .data = .{ .global_ref = id },
-                });
-                break :blk state.emit(.{
-                    .pos = node.pos,
-                    .tag = .load,
-                    .data = .{ .unary_op = ptr },
-                });
+                        .data = .{ .unary_op = ptr },
+                    });
+                },
+                .closure => @panic("TODO: fn closure error"),
+                .success => |name| {
+                    const inst = switch (name.tag) {
+                        .constant, .arg => name.inst,
+                        .variable => state.emit(.{
+                            .pos = node.pos,
+                            .tag = .load,
+                            .data = .{ .unary_op = name.inst },
+                        }),
+                    };
+                    break :blk inst;
+                },
             }
         },
 
