@@ -82,6 +82,10 @@ pub const math = struct {
             fnv.roll(&bytes);
         }
     };
+
+    pub fn parseInt(T: type, str: []const u8) !i64 {
+        return try std.fmt.parseInt(T, str, 0);
+    }
 };
 
 const std = @import("std");

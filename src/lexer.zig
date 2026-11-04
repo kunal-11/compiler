@@ -9,6 +9,7 @@ pub const Tag = enum {
     identifier,
 
     key_fn,
+    key_return,
 
     key_true,
     key_false,
@@ -134,6 +135,8 @@ fn parseWordToken(buf: []const u8, start: u32, end: u32) Token {
         .key_false
     else if (mem.eql(word, "undefined"))
         .key_undefined
+    else if (mem.eql(word, "return"))
+        .key_return
     else
         .identifier;
     return .{

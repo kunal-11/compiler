@@ -304,23 +304,25 @@ const NameTable = struct {
 pub const Decl = struct {
     pos: u32,
     name: InternPool.Id,
+    tag: enum { var_decl, const_decl },
+
     type: Ir.InstId,
     value: Ir.InstId,
-    tag: enum { var_decl, const_decl },
 };
 
 const max_decls = 1024;
-pub fn lowerFile(ctx: *Context, arena: *mem.Arena, file_id: File.Id, root_id: Ast.NodeId) []Decl {
-    const result = arena.pushArray(Decl, max_decls);
+pub fn lowerFile(ctx: *Context, file_id: File.Id, root_id: Ast.NodeId) []Decl {
+    const file = ctx.getFile(file_id);
+
+    const result = file.arena.pushArray(Decl, max_decls);
     var result_count: u32 = 0;
 
-    const flusher = mem.Flusher.init(arena);
+    const flusher = mem.Flusher.init(&file.arena);
     defer flusher.flush();
 
-    const file = ctx.getFile(file_id);
-    const state = arena.pushStruct(State);
+    const state = file.arena.pushStruct(State);
     state.* = .{
-        .arena = arena.subArena(1 * mem.MB),
+        .arena = file.arena.subArena(1 * mem.MB),
         .ctx = ctx,
         .ast = file.ast,
         .ir = file.untyped_ir,
@@ -371,7 +373,7 @@ fn lowerPtr(state: *State, node_id: Ast.NodeId) Ir.InstId {
                 .empty => {
                     break :blk state.emit(.{
                         .pos = node.pos,
-                        .tag = .global_ref,
+                        .tag = .global_ptr,
                         .data = .{ .global_ref = id },
                     });
                 },
@@ -425,43 +427,45 @@ fn lower(state: *State, node_id: Ast.NodeId) Ir.InstId {
             state.beginCompileBlock();
             const type_inst = lower(state, node.data.fn_lit.fn_type);
 
-            state.beginFnBlock(type_inst);
-            const type_node = state.ast.getNode(node.data.fn_lit.fn_type);
-            const args = state.ast.getNode(type_node.data.fn_type.args).data.block;
-            for (args, 0..) |arg, i| {
-                const arg_node = state.ast.getNode(arg);
-                const inst = state.emit(.{
-                    .pos = arg_node.pos,
-                    .tag = .fn_arg,
-                    .data = .{ .fn_arg = .{ .index = @intCast(i) } },
-                });
+            const lit = blk1: {
+                state.beginFnBlock(type_inst);
+                const type_node = state.ast.getNode(node.data.fn_lit.fn_type);
+                const args = state.ast.getNode(type_node.data.fn_type.args).data.block;
+                for (args, 0..) |arg, i| {
+                    const arg_node = state.ast.getNode(arg);
+                    const inst = state.emit(.{
+                        .pos = arg_node.pos,
+                        .tag = .fn_arg,
+                        .data = .{ .fn_arg = .{ .index = @intCast(i) } },
+                    });
 
-                const name = Name{
-                    .intern_id = arg_node.data.param.intern_id,
-                    .inst = inst,
-                    .tag = .arg,
-                };
-                switch (state.name_table.addName(name)) {
-                    .redeclared => debug.log("TODO: redecl error", .{}),
-                    .success => {},
+                    const name = Name{
+                        .intern_id = arg_node.data.param.intern_id,
+                        .inst = inst,
+                        .tag = .arg,
+                    };
+                    switch (state.name_table.addName(name)) {
+                        .redeclared => debug.log("TODO: redecl error", .{}),
+                        .success => {},
+                    }
                 }
-            }
-            const body_nodes = state.ast.getNode(node.data.fn_lit.block).data.block;
-            for (body_nodes) |body_node| {
-                _ = lower(state, body_node);
-            }
-            const res = state.emitBlock(node.pos, .none);
-            break :blk state.emitBlock(type_node.pos, res);
+                const body_nodes = state.ast.getNode(node.data.fn_lit.block).data.block;
+                for (body_nodes) |body_node| {
+                    _ = lower(state, body_node);
+                }
+                break :blk1 state.emitBlock(node.pos, .none);
+            };
+            break :blk state.emitBlock(node.pos, lit);
         },
         .fn_type => blk: {
+            state.beginCompileBlock();
+
             const flusher = mem.Flusher.init(&state.arena);
             defer flusher.flush();
 
-            state.beginCompileBlock();
-
+            const params_node = state.ast.getNode(node.data.fn_type.args);
             const arg_buf = state.arena.pushArray(Ir.InstId, max_fn_args);
             var arg_count: u32 = 0;
-            const params_node = state.ast.getNode(node.data.fn_type.args);
             for (params_node.data.block) |arg| {
                 const arg_node = state.ast.getNode(arg);
                 arg_buf[arg_count] = lower(state, arg_node.data.param.type);
@@ -537,15 +541,10 @@ fn lower(state: *State, node_id: Ast.NodeId) Ir.InstId {
             const id = node.data.identifier.intern_id;
             switch (state.name_table.findName(id)) {
                 .empty => {
-                    const ptr = state.emit(.{
-                        .pos = node.pos,
-                        .tag = .global_ref,
-                        .data = .{ .global_ref = id },
-                    });
                     break :blk state.emit(.{
                         .pos = node.pos,
-                        .tag = .load,
-                        .data = .{ .unary_op = ptr },
+                        .tag = .global_val,
+                        .data = .{ .global_ref = id },
                     });
                 },
                 .closure => @panic("TODO: fn closure error"),
@@ -595,11 +594,19 @@ fn lower(state: *State, node_id: Ast.NodeId) Ir.InstId {
                 } },
             });
         },
-        .negate => state.emit(.{
-            .pos = node.pos,
-            .tag = .negate,
-            .data = .{ .unary_op = lower(state, node.data.unary_op) },
-        }),
+
+        .negate, .ret => blk: {
+            const value = lower(state, node.data.unary_op);
+            break :blk state.emit(.{
+                .pos = node.pos,
+                .tag = switch (node.tag) {
+                    .negate => .negate,
+                    .ret => .ret,
+                    else => @panic("lower unary op table incomplete"),
+                },
+                .data = .{ .unary_op = value },
+            });
+        },
 
         .file, .param, .params => @panic("lower invalid node"),
     };

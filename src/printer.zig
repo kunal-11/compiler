@@ -75,13 +75,13 @@ pub fn debugPrintIr(
             });
         },
 
-        .num_lit, .type_lit, .bool_lit, .undef_lit, .reserved, .global_ref => {
+        .num_lit, .type_lit, .bool_lit, .undef_lit, .reserved, .global_val, .global_ptr => {
             const token = lexer.lexToken(file, inst.pos);
             const str = file[token.start..token.end];
             debug.print("%{} = {s} #{s}\n", .{ @backingInt(inst_id), @tagName(inst.tag), str });
         },
 
-        .add, .subtract, .mul, .div, .mod, .assign, .alloc, .store, .brk, .ret => {
+        .add, .subtract, .mul, .div, .mod, .alloc, .store, .brk => {
             debug.print("%{} = {s} %{} %{}\n", .{
                 @backingInt(inst_id),
                 @tagName(inst.tag),
@@ -89,7 +89,7 @@ pub fn debugPrintIr(
                 @backingInt(inst.data.bin_op.rhs),
             });
         },
-        .type_of, .load, .negate, .brk_implicit, .ret_implicit => {
+        .type_of, .load, .negate, .ret, .brk_implicit, .ret_implicit => {
             debug.print("%{} = {s} %{}\n", .{
                 @backingInt(inst_id),
                 @tagName(inst.tag),
@@ -152,7 +152,7 @@ pub fn debugPrintAst(
             debugPrintAst(file, ast, node.data.decl.param, child_len, false);
             debugPrintAst(file, ast, node.data.decl.value, child_len, true);
         },
-        .negate => {
+        .negate, .ret => {
             debugPrintAst(file, ast, node.data.unary_op, child_len, true);
         },
         .add, .subtract, .mul, .div, .mod, .assign => {

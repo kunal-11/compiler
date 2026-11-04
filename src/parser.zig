@@ -80,34 +80,34 @@ fn opPrecedence(tag: lexer.Tag, prefix: bool) u32 {
 }
 
 const State = struct {
-    arena: mem.Arena,
     ctx: *Context,
     file_id: File.Id,
     ast: *Ast,
     tokens: TokenCache,
+
+    node_stack: [8192]Ast.NodeId = undefined,
+    node_count: u32 = 0,
 };
 
 const ParseError = error{ UnexpectedToken, IntrinsicShadowing };
 
-const max_file_decls = 2048;
-pub fn parseFile(ctx: *Context, arena: *mem.Arena, file_id: File.Id) Ast.NodeId {
-    const flusher = mem.Flusher.init(arena);
+pub fn parseFile(ctx: *Context, file_id: File.Id) Ast.NodeId {
+    const file = ctx.getFile(file_id);
+
+    const flusher = mem.Flusher.init(&file.arena);
     defer flusher.flush();
 
-    const file = ctx.getFile(file_id);
-    var state = State{
+    const state = file.arena.pushStruct(State);
+    state.* = .{
         .ctx = ctx,
         .file_id = file_id,
         .ast = file.ast,
-        .arena = arena.subArena(8 * mem.MB),
         .tokens = .{ .buf = file.contents },
     };
 
-    const decls = state.arena.pushArray(Ast.NodeId, max_file_decls);
-    var decl_count: u32 = 0;
     while (state.tokens.peek().tag != .eof) {
-        decls[decl_count] = parseDecl(&state) catch {
-            skipStatement(&state);
+        state.node_stack[state.node_count] = parseDecl(state) catch {
+            skipStatement(state);
             const token = state.tokens.peek();
             if (token.tag == .close_brace) {
                 state.ctx.addMsg(.{
@@ -122,13 +122,13 @@ pub fn parseFile(ctx: *Context, arena: *mem.Arena, file_id: File.Id) Ast.NodeId 
             }
             continue;
         };
-        decl_count += 1;
+        state.node_count += 1;
     }
 
     return state.ast.allocNode(.{
         .pos = 0,
         .tag = .file,
-        .data = .{ .block = decls[0..decl_count] },
+        .data = .{ .block = state.node_stack[0..state.node_count] },
     });
 }
 
@@ -193,22 +193,19 @@ fn parseDecl(state: *State) ParseError!Ast.NodeId {
 
 const max_block_statements = 8192;
 fn parseBlock(state: *State) ParseError!Ast.NodeId {
-    const flusher = mem.Flusher.init(&state.arena);
-    defer flusher.flush();
-
-    const scratch = state.arena.pushArray(Ast.NodeId, max_block_statements);
-    var node_count: u32 = 0;
+    const node_marker = state.node_count;
+    defer state.node_count = node_marker;
 
     const open_token = try expect(state, .open_brace);
     while (true) {
         switch (state.tokens.peek().tag) {
             .eof, .close_brace => break,
             else => {
-                scratch[node_count] = parseStatement(state) catch {
+                state.node_stack[state.node_count] = parseStatement(state) catch {
                     skipStatement(state);
                     continue;
                 };
-                node_count += 1;
+                state.node_count += 1;
             },
         }
     }
@@ -217,13 +214,25 @@ fn parseBlock(state: *State) ParseError!Ast.NodeId {
     return state.ast.allocNode(.{
         .pos = open_token.start,
         .tag = .block,
-        .data = .{ .block = scratch[0..node_count] },
+        .data = .{ .block = state.node_stack[node_marker..state.node_count] },
     });
 }
 
 fn parseStatement(state: *State) ParseError!Ast.NodeId {
-    switch (state.tokens.peek().tag) {
+    const token = state.tokens.peek();
+    switch (token.tag) {
         .identifier => if (state.tokens.peek2().tag == .colon) return try parseDecl(state),
+        .key_return => {
+            state.tokens.advance();
+            const expr = try parseExpression(state, min_bind_power);
+            const result = state.ast.allocNode(.{
+                .pos = token.start,
+                .tag = .ret,
+                .data = .{ .unary_op = expr },
+            });
+            _ = try expect(state, .semicolon);
+            return result;
+        },
         else => {},
     }
 
@@ -258,16 +267,13 @@ const max_fn_args = 256;
 fn parseFnType(state: *State) ParseError!Ast.NodeId {
     const fn_token = try expect(state, .key_fn);
 
-    const flusher = mem.Flusher.init(&state.arena);
-    defer flusher.flush();
-
-    const arg_nodes = state.arena.pushArray(Ast.NodeId, max_fn_args);
-    var arg_count: u32 = 0;
+    const node_marker = state.node_count;
+    defer state.node_count = node_marker;
 
     const paren_node = try expect(state, .open_paren);
     while (state.tokens.peek().tag == .identifier) {
-        arg_nodes[arg_count] = try parseParam(state);
-        arg_count += 1;
+        state.node_stack[state.node_count] = try parseParam(state);
+        state.node_count += 1;
 
         if (state.tokens.peek().tag == .comma) {
             state.tokens.advance();
@@ -280,7 +286,7 @@ fn parseFnType(state: *State) ParseError!Ast.NodeId {
     const args_node = state.ast.allocNode(.{
         .pos = paren_node.start,
         .tag = .params,
-        .data = .{ .block = arg_nodes[0..arg_count] },
+        .data = .{ .block = state.node_stack[node_marker..state.node_count] },
     });
 
     return state.ast.allocNode(.{
