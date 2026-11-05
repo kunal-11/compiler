@@ -96,6 +96,8 @@ pub const File = struct {
 
     ast: *Ast,
     untyped_ir: *UntypedIr,
+
+    analysis: []analyzer.Value,
 };
 
 pub const Namespace = struct {
@@ -193,6 +195,9 @@ pub const TypeLit = enum(u32) {
     f32,
     f64,
 
+    comp_int,
+    comp_float,
+
     bool,
     void,
     noreturn,
@@ -224,6 +229,10 @@ pub const TypeLit = enum(u32) {
             .f32
         else if (mem.eql(str, "f64"))
             .f64
+        else if (mem.eql(str, "comp_int"))
+            .comp_int
+        else if (mem.eql(str, "comp_float"))
+            .comp_float
         else if (mem.eql(str, "bool"))
             .bool
         else if (mem.eql(str, "void"))
@@ -797,7 +806,7 @@ pub const Constant = struct {
 
     tag: Tag,
     data: union {
-        type: TypeLit,
+        type_lit: TypeLit,
         fn_type: struct { ret: Id, args: []Id },
     },
 
@@ -805,7 +814,7 @@ pub const Constant = struct {
         var fnv = math.Fnv{};
         fnv.roll(&.{@backingInt(c.tag)});
         switch (c.tag) {
-            .type_lit => fnv.roll32(@backingInt(c.data.type)),
+            .type_lit => fnv.roll32(@backingInt(c.data.type_lit)),
             .fn_type => {
                 fnv.roll32(@backingInt(c.data.fn_type.ret));
                 for (c.data.fn_type.args) |arg| {
@@ -819,7 +828,7 @@ pub const Constant = struct {
     fn eql(c1: Constant, c2: Constant) bool {
         if (c1.tag != c2.tag) return false;
         return switch (c1.tag) {
-            .type_lit => c1.data.type == c2.data.type,
+            .type_lit => c1.data.type_lit == c2.data.type_lit,
             .fn_type => blk: {
                 if (c1.data.fn_type.ret != c2.data.fn_type.ret or
                     c1.data.fn_type.args.len != c2.data.fn_type.args.len)
@@ -881,7 +890,7 @@ pub const Constant = struct {
 
         fn pack(pool: *Pool, val: Constant) Packed {
             return switch (val.tag) {
-                .type_lit => .{ .tag = val.tag, .v = @backingInt(val.data.type) },
+                .type_lit => .{ .tag = val.tag, .v = @backingInt(val.data.type_lit) },
                 .fn_type => blk: {
                     const extra_offset = pool.extra_count;
                     pool.extras[pool.extra_count] = @backingInt(val.data.fn_type.ret);
@@ -904,7 +913,7 @@ pub const Constant = struct {
             return switch (p.tag) {
                 .type_lit => .{
                     .tag = p.tag,
-                    .data = .{ .type = @fromBackingInt(p.v) },
+                    .data = .{ .type_lit = @fromBackingInt(p.v) },
                 },
                 .fn_type => blk: {
                     const ret: Id = @fromBackingInt(pool.extras[p.v]);
