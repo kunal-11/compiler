@@ -20,10 +20,7 @@ pub const Queue = struct {
             file: File.Id,
             symbol: Symbol.Id,
         },
-        fn_lit: struct {
-            file: File.Id,
-            inst_id: UntypedIr.InstId,
-        },
+        fn_lit: Constant.Id,
     };
 
     const len = 1024;
@@ -48,12 +45,11 @@ pub const Queue = struct {
 pub const Value = struct {
     type: Constant.Id,
     val: union(enum) {
-        empty,
         type: Constant.Id,
         number: i64,
         boolean: bool,
         undef: void,
-        fn_lit: UntypedIr.InstId,
+        fn_lit: Constant.Id,
     },
 };
 
@@ -73,32 +69,32 @@ pub fn analyze(ctx: *Context, arena: *mem.Arena) void {
 
                 switch (result.val) {
                     .fn_lit => {
-                        ctx.analysis_q.push(.{ .fn_lit = .{
-                            .file = decl.file,
-                            .inst_id = result_id,
-                        } });
+                        const entry = ctx.constants.getSideEntry(result.val.fn_lit);
+                        if (entry.fn_lit == .unchecked) {
+                            ctx.analysis_q.push(.{ .fn_lit = result.val.fn_lit });
+                            entry.* = .{ .fn_lit = .queued };
+                        }
                     },
                     else => {},
                 }
+                symbol.result = result;
 
                 const name_token = lexer.lexToken(file.contents, symbol.pos);
                 const name_str = file.contents[name_token.start..name_token.end];
-
                 debug.log("analyzed value: {s} = {}", .{ name_str, result });
             },
             .fn_lit => |lit| {
-                typeCheckFn(ctx, lit.file, lit.inst_id);
+                const data = ctx.constants.get(lit);
+                debug.assert(
+                    ctx.constants.getSideEntry(lit).fn_lit == .queued,
+                    "fn check item invalid status",
+                );
+                const typed_inst = typeCheckFn(ctx, data.data.fn_lit.file, data.data.fn_lit.inst);
+                ctx.constants.getSideEntry(lit).* = .{ .fn_lit = .{ .checked = typed_inst } };
             },
             .empty => unreachable,
         }
     }
-}
-
-fn typeCheckFn(ctx: *Context, file_id: File.Id, inst_id: UntypedIr.InstId) void {
-    const file = ctx.getFile(file_id);
-    const inst = file.untyped_ir.getInst(inst_id);
-    _ = inst;
-    // TODO:
 }
 
 fn evaluate(
@@ -112,7 +108,7 @@ fn evaluate(
     if (file.analysis.len == 0) {
         file.analysis = file.arena.pushArray(Value, file.untyped_ir.inst_count);
         // just for safety check ?
-        for (file.analysis) |*r| r.* = .{ .type = .none, .val = .empty };
+        for (file.analysis) |*r| r.* = .{ .type = .none, .val = undefined };
     }
     const results = file.analysis;
 
@@ -135,7 +131,7 @@ fn evaluate(
                 const ret = results[@backingInt(inst.data.fn_type.return_type)].val.type;
                 const args = arena.pushArray(Constant.Id, inst.data.fn_type.arg_types.len);
                 for (inst.data.fn_type.arg_types, 0..) |arg, i| {
-                    args[i] = results[@backingInt(arg)].type;
+                    args[i] = results[@backingInt(arg)].val.type;
                 }
 
                 const constant_id = ctx.constants.getOrAddId(.{
@@ -163,7 +159,7 @@ fn evaluate(
                 const type_res = file.analysis[@backingInt(inst.data.fn_lit.type)];
                 break :blk .{
                     .type = type_res.val.type,
-                    .val = .{ .fn_lit = inst_id },
+                    .val = .{ .fn_lit = addFnLitConstant(ctx, file_id, inst_id) },
                 };
             },
 
@@ -174,9 +170,36 @@ fn evaluate(
     @panic("Eval: compile block did not break");
 }
 
+fn addFnLitConstant(ctx: *Context, file: File.Id, inst: UntypedIr.InstId) Constant.Id {
+    const const_id = ctx.constants.getOrAddId(.{
+        .tag = .fn_lit,
+        .data = .{ .fn_lit = .{ .file = file, .inst = inst } },
+    });
+    const entry = ctx.constants.getSideEntry(const_id);
+    if (entry.* == .empty) {
+        entry.* = .{ .fn_lit = .unchecked };
+    }
+    return const_id;
+}
+
 fn getTypeId(ctx: *Context, lit: TypeLit) Constant.Id {
     return ctx.constants.getOrAddId(.{
         .tag = .type_lit,
         .data = .{ .type_lit = lit },
     });
+}
+
+fn typeCheckFn(ctx: *Context, file_id: File.Id, inst_id: UntypedIr.InstId) TypedIr.InstId {
+    const file = ctx.getFile(file_id);
+    const lit = file.untyped_ir.getInst(inst_id).data.fn_lit;
+
+    const type_id = file.analysis[@backingInt(lit.type)].val.type;
+    const type_val = ctx.constants.get(type_id);
+    debug.assert(type_val.tag == .fn_type, "fn type invalid");
+
+    debug.log("type checking fn with type: {}", .{type_val.data.fn_type});
+    for (lit.body) |inst| {
+        _ = inst;
+    }
+    return .none;
 }

@@ -667,6 +667,9 @@ fn lower(state: *State, node_id: Ast.NodeId) Ir.InstId {
         },
 
         .add, .subtract, .mul, .div, .mod => blk: {
+            if (node.data.bin_op.lhs == .poison or node.data.bin_op.rhs == .poison)
+                break :blk .poison;
+
             const lhs = lower(state, node.data.bin_op.lhs);
             const rhs = lower(state, node.data.bin_op.rhs);
             break :blk state.emit(.{

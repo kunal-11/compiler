@@ -87,7 +87,10 @@ pub const Context = struct {
 };
 
 pub const File = struct {
+    const max_fns = 1024;
+
     pub const Id = enum(u32) { none = 0, _ };
+    pub const FnId = enum(u32) { none = 0, _ };
 
     arena: mem.Arena,
     path: []const u8,
@@ -95,6 +98,7 @@ pub const File = struct {
 
     ast: *Ast,
     untyped_ir: *UntypedIr,
+    typed_ir: *TypedIr,
 
     analysis: []analyzer.Value,
 };
@@ -175,6 +179,9 @@ pub const Symbol = struct {
     pos: u32,
     type_inst: UntypedIr.InstId = .none,
     value_inst: UntypedIr.InstId,
+
+    // maybe change this to a constant type and value ?
+    result: analyzer.Value,
     tag: enum { variable, constant },
 };
 
@@ -799,12 +806,23 @@ pub const Constant = struct {
     pub const Tag = enum(u8) {
         type_lit,
         fn_type,
+        fn_lit,
+    };
+
+    pub const SideEntry = union(enum) {
+        empty,
+        fn_lit: union(enum) {
+            unchecked,
+            queued,
+            checked: TypedIr.InstId,
+        },
     };
 
     tag: Tag,
     data: union {
         type_lit: TypeLit,
         fn_type: struct { ret: Id, args: []Id },
+        fn_lit: struct { file: File.Id, inst: UntypedIr.InstId },
     },
 
     fn hash(c: Constant) u64 {
@@ -817,6 +835,10 @@ pub const Constant = struct {
                 for (c.data.fn_type.args) |arg| {
                     fnv.roll32(@backingInt(arg));
                 }
+            },
+            .fn_lit => {
+                fnv.roll32(@backingInt(c.data.fn_lit.file));
+                fnv.roll32(@backingInt(c.data.fn_lit.inst));
             },
         }
         return fnv.hash;
@@ -841,6 +863,8 @@ pub const Constant = struct {
 
                 break :blk true;
             },
+            .fn_lit => c1.data.fn_lit.file == c2.data.fn_lit.file and
+                c1.data.fn_lit.inst == c2.data.fn_lit.inst,
         };
     }
 
@@ -854,6 +878,7 @@ pub const Constant = struct {
         buckets: [max_buckets]Id = @splat(.none),
         next: [max_constants]Id = @splat(.none),
 
+        side_table: [max_constants]SideEntry = undefined,
         constants: [max_constants]Packed = undefined,
         next_id: u32 = 1,
 
@@ -871,13 +896,19 @@ pub const Constant = struct {
                 slot.* = @fromBackingInt(pool.next_id);
                 pool.next_id += 1;
                 pool.constants[@backingInt(slot.*)] = pool.pack(val);
+                pool.side_table[@backingInt(slot.*)] = .empty;
             }
             return slot.*;
         }
 
         pub fn get(pool: *Pool, id: Id) Constant {
-            debug.assert(id != .none, "constant pool get id");
+            debug.assert(id != .none, "constant pool get none id");
             return pool.unpack(pool.constants[@backingInt(id)]);
+        }
+
+        pub fn getSideEntry(pool: *Pool, id: Id) *SideEntry {
+            debug.assert(id != .none, "constant pool get none id");
+            return &pool.side_table[@backingInt(id)];
         }
 
         const Packed = struct {
@@ -903,6 +934,14 @@ pub const Constant = struct {
 
                     break :blk .{ .tag = val.tag, .v = extra_offset };
                 },
+                .fn_lit => blk: {
+                    const extra_offset = pool.extra_count;
+                    pool.extras[pool.extra_count] = @backingInt(val.data.fn_lit.file);
+                    pool.extra_count += 1;
+                    pool.extras[pool.extra_count] = @backingInt(val.data.fn_lit.inst);
+                    pool.extra_count += 1;
+                    break :blk .{ .tag = val.tag, .v = extra_offset };
+                },
             };
         }
 
@@ -923,6 +962,13 @@ pub const Constant = struct {
                             .args = ptr[0..count],
                         } },
                     };
+                },
+                .fn_lit => .{
+                    .tag = p.tag,
+                    .data = .{ .fn_lit = .{
+                        .file = @fromBackingInt(pool.extras[p.v]),
+                        .inst = @fromBackingInt(pool.extras[p.v + 1]),
+                    } },
                 },
             };
         }

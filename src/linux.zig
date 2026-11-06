@@ -10,6 +10,7 @@ const test_file = "testdir/mod1/main.pnx";
 const Context = @import("types.zig").Context;
 const Ast = @import("types.zig").Ast;
 const UntypedIr = @import("types.zig").UntypedIr;
+const TypedIr = @import("types.zig").TypedIr;
 const File = @import("types.zig").File;
 const Namespace = @import("types.zig").Namespace;
 const Symbol = @import("types.zig").Symbol;
@@ -60,6 +61,9 @@ fn loadFile(ctx: *Context, arena: *mem.Arena, ns_id: Namespace.Id, path: []const
     const untyped_ir = file_arena.pushStruct(UntypedIr);
     untyped_ir.* = .{};
 
+    const typed_ir = file_arena.pushStruct(TypedIr);
+    typed_ir.* = .{};
+
     const ns = ctx.getNamespace(ns_id);
     const file_id = ctx.addFile(.{
         .arena = file_arena,
@@ -67,6 +71,7 @@ fn loadFile(ctx: *Context, arena: *mem.Arena, ns_id: Namespace.Id, path: []const
         .contents = file_buf,
         .ast = ast,
         .untyped_ir = untyped_ir,
+        .typed_ir = typed_ir,
         .analysis = &.{},
     });
 
@@ -94,6 +99,7 @@ fn loadFile(ctx: *Context, arena: *mem.Arena, ns_id: Namespace.Id, path: []const
             .pos = decl.pos,
             .value_inst = decl.value,
             .type_inst = decl.type,
+            .result = undefined,
         });
 
         switch (ns.add(decl.name, symbol_id)) {
