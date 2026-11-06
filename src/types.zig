@@ -17,20 +17,19 @@ pub const Message = struct {
     severity: Severity,
     pos: Position,
     data: union(enum) {
+        unexpected_operator,
+        expected_binding_op,
+        expected_expression,
+        expected_type,
+        expected_lvalue,
+        name_shadows_type: TypeLit,
         unexpected_token: struct {
             expected: lexer.Tag,
-            found: lexer.Tag,
-        },
-        unexpected_operator: struct {
-            found: lexer.Tag,
-        },
-        name_shadows_type: struct {
-            found: TypeLit,
-        },
-        expected_binding_op: struct {
-            found: lexer.Tag,
         },
         duplicate_decl: struct {
+            original_pos: Position,
+        },
+        closure_on_variable: struct {
             original_pos: Position,
         },
     },
@@ -449,17 +448,16 @@ pub const Ast = struct {
         rhs: u32,
     };
 
-    pub const NodeId = enum(u32) { none = 0, _ };
-    pub const ExtraId = enum(u32) { none = 0, _ };
+    pub const NodeId = enum(u32) { none = 0, poison = 1, _ };
 
     const max_nodes = 8192;
     const max_extras = 4096;
 
     nodes: [max_nodes]PackedNode = undefined,
-    node_count: u32 = 1,
+    node_count: u32 = 2,
 
     extras: [max_extras]u32 = undefined,
-    extra_count: u32 = 1,
+    extra_count: u32 = 0,
 };
 
 pub const UntypedIr = struct {
@@ -675,17 +673,16 @@ pub const UntypedIr = struct {
         };
     }
 
-    pub const InstId = enum(u32) { none = 0, _ };
-    pub const ExtraId = enum(u32) { none = 0, _ };
+    pub const InstId = enum(u32) { none = 0, poison = 1, _ };
 
     const max_insts = 8192;
     const max_extras = 8192;
 
     insts: [max_insts]PackedInst = undefined,
-    inst_count: u32 = 1,
+    inst_count: u32 = 2,
 
     extras: [max_extras]u32 = undefined,
-    extra_count: u32 = 1,
+    extra_count: u32 = 0,
 
     pub fn getInst(ir: *UntypedIr, id: InstId) Inst {
         debug.assert(id != .none, "get none untyped inst");

@@ -29,6 +29,8 @@ const State = struct {
     ast: *Ast,
     ir: *Ir,
 
+    file_id: File.Id,
+
     insts: [max_instructions]Ir.InstId = undefined,
     inst_count: u32 = 0,
 
@@ -186,6 +188,7 @@ const State = struct {
 };
 
 const Name = struct {
+    pos: u32,
     intern_id: InternPool.Id,
     inst: Ir.InstId,
     tag: enum { arg, constant, variable },
@@ -204,6 +207,7 @@ const NameTable = struct {
         .name = .{
             .intern_id = .none,
             .inst = .none,
+            .pos = undefined,
             .tag = undefined,
         },
         .fn_depth = undefined,
@@ -237,7 +241,6 @@ const NameTable = struct {
         redeclared: Name,
     };
 
-    // returns the existing name if redecl, caller to check and emit error
     pub fn addName(table: *NameTable, name: Name) AddResult {
         const slot = table.getSlot(name.intern_id);
 
@@ -249,6 +252,7 @@ const NameTable = struct {
         table.undo_stack[table.undo_len] = .{
             .name = .{
                 .intern_id = name.intern_id,
+                .pos = slot.name.pos,
                 .inst = slot.name.inst,
                 .tag = slot.name.tag,
             },
@@ -311,21 +315,21 @@ pub const Decl = struct {
 };
 
 const max_decls = 1024;
-pub fn lowerFile(ctx: *Context, file_id: File.Id, root_id: Ast.NodeId) []Decl {
-    const file = ctx.getFile(file_id);
-
-    const result = file.arena.pushArray(Decl, max_decls);
+pub fn lowerFile(ctx: *Context, arena: *mem.Arena, file_id: File.Id, root_id: Ast.NodeId) []Decl {
+    const result = arena.pushArray(Decl, max_decls);
     var result_count: u32 = 0;
 
-    const flusher = mem.Flusher.init(&file.arena);
+    const flusher = mem.Flusher.init(arena);
     defer flusher.flush();
 
-    const state = file.arena.pushStruct(State);
+    const file = ctx.getFile(file_id);
+    const state = arena.pushStruct(State);
     state.* = .{
-        .arena = file.arena.subArena(1 * mem.MB),
+        .arena = arena.subArena(1 * mem.MB),
         .ctx = ctx,
         .ast = file.ast,
         .ir = file.untyped_ir,
+        .file_id = file_id,
     };
 
     const node = state.ast.getNode(root_id);
@@ -364,12 +368,27 @@ pub fn lowerFile(ctx: *Context, file_id: File.Id, root_id: Ast.NodeId) []Decl {
 }
 
 fn lowerPtr(state: *State, node_id: Ast.NodeId) Ir.InstId {
+    debug.assert(node_id != .none, "lower none node");
+    if (node_id == .poison) return .poison;
+
     const node = state.ast.getNode(node_id);
     return switch (node.tag) {
         .identifier => blk: {
             const id = node.data.identifier.intern_id;
             switch (state.name_table.findName(id)) {
-                .closure => @panic("TODO: closure error"),
+                .closure => |name| {
+                    state.ctx.addMsg(.{
+                        .severity = .err,
+                        .pos = .{ .file = state.file_id, .offset = node.pos },
+                        .data = .{ .closure_on_variable = .{
+                            .original_pos = .{
+                                .file = state.file_id,
+                                .offset = name.pos,
+                            },
+                        } },
+                    });
+                    break :blk .poison;
+                },
                 .empty => {
                     break :blk state.emit(.{
                         .pos = node.pos,
@@ -379,19 +398,36 @@ fn lowerPtr(state: *State, node_id: Ast.NodeId) Ir.InstId {
                 },
                 .success => |name| {
                     const inst = switch (name.tag) {
-                        .constant, .arg => @panic("TODO: invalid lvalue error"),
+                        .constant, .arg => blk1: {
+                            state.ctx.addMsg(.{
+                                .severity = .err,
+                                .pos = .{ .file = state.file_id, .offset = node.pos },
+                                .data = .expected_lvalue,
+                            });
+                            break :blk1 .poison;
+                        },
                         .variable => name.inst,
                     };
                     break :blk inst;
                 },
             }
         },
-        else => @panic("TODO: invalid lvalue error"),
+        else => blk1: {
+            state.ctx.addMsg(.{
+                .severity = .err,
+                .pos = .{ .file = state.file_id, .offset = node.pos },
+                .data = .expected_lvalue,
+            });
+            break :blk1 .poison;
+        },
     };
 }
 
 const max_fn_args = 1024;
 fn lower(state: *State, node_id: Ast.NodeId) Ir.InstId {
+    debug.assert(node_id != .none, "lower none node");
+    if (node_id == .poison) return .poison;
+
     const node = state.ast.getNode(node_id);
     return switch (node.tag) {
         .block => blk: {
@@ -440,12 +476,27 @@ fn lower(state: *State, node_id: Ast.NodeId) Ir.InstId {
                     });
 
                     const name = Name{
+                        .pos = arg_node.pos,
                         .intern_id = arg_node.data.param.intern_id,
                         .inst = inst,
                         .tag = .arg,
                     };
                     switch (state.name_table.addName(name)) {
-                        .redeclared => debug.log("TODO: redecl error", .{}),
+                        .redeclared => |og_name| {
+                            state.ctx.addMsg(.{
+                                .pos = .{
+                                    .file = state.file_id,
+                                    .offset = arg_node.pos,
+                                },
+                                .severity = .err,
+                                .data = .{ .duplicate_decl = .{
+                                    .original_pos = .{
+                                        .file = state.file_id,
+                                        .offset = og_name.pos,
+                                    },
+                                } },
+                            });
+                        },
                         .success => {},
                     }
                 }
@@ -485,23 +536,37 @@ fn lower(state: *State, node_id: Ast.NodeId) Ir.InstId {
         },
 
         .const_decl => blk: {
-            const param = state.ast.getNode(node.data.decl.param).data.param;
-            if (param.type != .none) {
+            const param = state.ast.getNode(node.data.decl.param);
+            if (param.data.param.type != .none) {
                 @panic("TODO: explicitly typed local constants");
             }
 
             state.beginCompileBlock();
-            const value_node = state.ast.getNode(node.data.decl.value);
             const res = lower(state, node.data.decl.value);
-            const inst = state.emitBlock(value_node.pos, res);
+            const inst = state.emitBlock(node.pos, res);
 
             const name = Name{
-                .intern_id = param.intern_id,
+                .pos = param.pos,
+                .intern_id = param.data.param.intern_id,
                 .inst = inst,
                 .tag = .constant,
             };
             switch (state.name_table.addName(name)) {
-                .redeclared => debug.log("TODO: redecl error", .{}),
+                .redeclared => |og_name| {
+                    state.ctx.addMsg(.{
+                        .pos = .{
+                            .file = state.file_id,
+                            .offset = param.pos,
+                        },
+                        .severity = .err,
+                        .data = .{ .duplicate_decl = .{
+                            .original_pos = .{
+                                .file = state.file_id,
+                                .offset = og_name.pos,
+                            },
+                        } },
+                    });
+                },
                 .success => {},
             }
             break :blk inst;
@@ -525,14 +590,28 @@ fn lower(state: *State, node_id: Ast.NodeId) Ir.InstId {
                 .tag = .alloc,
                 .data = .{ .bin_op = .{ .lhs = type_inst, .rhs = value_inst } },
             });
-
             const name = Name{
+                .pos = param.pos,
                 .intern_id = param.data.param.intern_id,
                 .inst = inst,
                 .tag = .variable,
             };
             switch (state.name_table.addName(name)) {
-                .redeclared => debug.log("TODO: redecl error", .{}),
+                .redeclared => |og_name| {
+                    state.ctx.addMsg(.{
+                        .pos = .{
+                            .file = state.file_id,
+                            .offset = param.pos,
+                        },
+                        .severity = .err,
+                        .data = .{ .duplicate_decl = .{
+                            .original_pos = .{
+                                .file = state.file_id,
+                                .offset = og_name.pos,
+                            },
+                        } },
+                    });
+                },
                 .success => {},
             }
             break :blk inst;
@@ -547,7 +626,19 @@ fn lower(state: *State, node_id: Ast.NodeId) Ir.InstId {
                         .data = .{ .global_ref = id },
                     });
                 },
-                .closure => @panic("TODO: fn closure error"),
+                .closure => |name| {
+                    state.ctx.addMsg(.{
+                        .severity = .err,
+                        .pos = .{ .file = state.file_id, .offset = node.pos },
+                        .data = .{ .closure_on_variable = .{
+                            .original_pos = .{
+                                .file = state.file_id,
+                                .offset = name.pos,
+                            },
+                        } },
+                    });
+                    break :blk .poison;
+                },
                 .success => |name| {
                     const inst = switch (name.tag) {
                         .constant, .arg => name.inst,
@@ -595,13 +686,24 @@ fn lower(state: *State, node_id: Ast.NodeId) Ir.InstId {
             });
         },
 
-        .negate, .ret => blk: {
+        .ret => blk: {
+            const value = if (node.data.unary_op == .none)
+                .none
+            else
+                lower(state, node.data.unary_op);
+
+            break :blk state.emit(.{
+                .pos = node.pos,
+                .tag = .ret,
+                .data = .{ .unary_op = value },
+            });
+        },
+        .negate => blk: {
             const value = lower(state, node.data.unary_op);
             break :blk state.emit(.{
                 .pos = node.pos,
                 .tag = switch (node.tag) {
                     .negate => .negate,
-                    .ret => .ret,
                     else => @panic("lower unary op table incomplete"),
                 },
                 .data = .{ .unary_op = value },

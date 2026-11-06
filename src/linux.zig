@@ -41,6 +41,9 @@ const io = std.Io.Threaded.global_single_threaded.io();
 fn loadFile(ctx: *Context, arena: *mem.Arena, ns_id: Namespace.Id, path: []const u8) !File.Id {
     var file_arena = arena.subArena(4 * mem.MB);
 
+    const flusher = mem.Flusher.init(arena);
+    defer flusher.flush();
+
     const file_handle = try std.Io.Dir.cwd().openFile(io, path, .{});
     defer file_handle.close(io);
 
@@ -67,10 +70,10 @@ fn loadFile(ctx: *Context, arena: *mem.Arena, ns_id: Namespace.Id, path: []const
         .analysis = &.{},
     });
 
-    const root_node = parser.parseFile(ctx, file_id);
+    const root_node = parser.parseFile(ctx, arena, file_id);
     printer.debugPrintAst(file_buf, ast, root_node, 0, true);
 
-    const decls = untyped_lower.lowerFile(ctx, file_id, root_node);
+    const decls = untyped_lower.lowerFile(ctx, arena, file_id, root_node);
     for (decls) |decl| {
         debug.print("Decl: {s} {s}\n", .{
             ctx.intern_pool.getString(decl.name),

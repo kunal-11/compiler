@@ -89,15 +89,15 @@ const State = struct {
     node_count: u32 = 0,
 };
 
-const ParseError = error{ UnexpectedToken, IntrinsicShadowing };
+const ParseError = error{ UnexpectedToken, IntrinsicShadowing, ExpectedExpression };
 
-pub fn parseFile(ctx: *Context, file_id: File.Id) Ast.NodeId {
+pub fn parseFile(ctx: *Context, arena: *mem.Arena, file_id: File.Id) Ast.NodeId {
     const file = ctx.getFile(file_id);
 
-    const flusher = mem.Flusher.init(&file.arena);
+    const flusher = mem.Flusher.init(arena);
     defer flusher.flush();
 
-    const state = file.arena.pushStruct(State);
+    const state = arena.pushStruct(State);
     state.* = .{
         .ctx = ctx,
         .file_id = file_id,
@@ -115,7 +115,6 @@ pub fn parseFile(ctx: *Context, file_id: File.Id) Ast.NodeId {
                     .severity = .err,
                     .data = .{ .unexpected_token = .{
                         .expected = .identifier,
-                        .found = token.tag,
                     } },
                 });
                 state.tokens.advance();
@@ -139,7 +138,7 @@ fn parseDecl(state: *State) ParseError!Ast.NodeId {
         state.ctx.addMsg(.{
             .severity = .err,
             .pos = .{ .file = state.file_id, .offset = identifier.start },
-            .data = .{ .name_shadows_type = .{ .found = type_lit } },
+            .data = .{ .name_shadows_type = type_lit },
         });
         return error.IntrinsicShadowing;
     }
@@ -147,7 +146,7 @@ fn parseDecl(state: *State) ParseError!Ast.NodeId {
 
     const type_node = switch (state.tokens.peek().tag) {
         .colon, .equals => .none,
-        else => try parseType(state),
+        else => parseType(state) catch .poison,
     };
 
     const intern_id = state.ctx.intern_pool.getOrCreateId(str);
@@ -168,16 +167,14 @@ fn parseDecl(state: *State) ParseError!Ast.NodeId {
             state.ctx.addMsg(.{
                 .pos = .{ .file = state.file_id, .offset = op_token.start },
                 .severity = .err,
-                .data = .{
-                    .expected_binding_op = .{ .found = op_token.tag },
-                },
+                .data = .expected_binding_op,
             });
             return error.UnexpectedToken;
         },
     };
     state.tokens.advance();
 
-    const value_node = try parseExpression(state, min_bind_power);
+    const value_node = parseExpression(state, min_bind_power) catch .poison;
 
     _ = try expect(state, .semicolon);
 
@@ -224,7 +221,11 @@ fn parseStatement(state: *State) ParseError!Ast.NodeId {
         .identifier => if (state.tokens.peek2().tag == .colon) return try parseDecl(state),
         .key_return => {
             state.tokens.advance();
-            const expr = try parseExpression(state, min_bind_power);
+            const expr = if (state.tokens.peek().tag == .semicolon)
+                .none
+            else
+                try parseExpression(state, min_bind_power);
+
             const result = state.ast.allocNode(.{
                 .pos = token.start,
                 .tag = .ret,
@@ -259,7 +260,14 @@ fn parseType(state: *State) ParseError!Ast.NodeId {
         // TODO: change this to type expr if we allow type gen macros
         .identifier => try parseIdentifier(state),
         .key_fn => try parseFnType(state),
-        else => @panic("TODO"),
+        else => {
+            state.ctx.addMsg(.{
+                .severity = .err,
+                .pos = .{ .file = state.file_id, .offset = token.start },
+                .data = .expected_type,
+            });
+            return error.ExpectedExpression;
+        },
     };
 }
 
@@ -272,7 +280,7 @@ fn parseFnType(state: *State) ParseError!Ast.NodeId {
 
     const paren_node = try expect(state, .open_paren);
     while (state.tokens.peek().tag == .identifier) {
-        state.node_stack[state.node_count] = try parseParam(state);
+        state.node_stack[state.node_count] = try parseFnArg(state);
         state.node_count += 1;
 
         if (state.tokens.peek().tag == .comma) {
@@ -299,20 +307,20 @@ fn parseFnType(state: *State) ParseError!Ast.NodeId {
     });
 }
 
-fn parseParam(state: *State) ParseError!Ast.NodeId {
+fn parseFnArg(state: *State) ParseError!Ast.NodeId {
     const identifier = try expect(state, .identifier);
     const str = state.tokens.str(identifier);
     if (TypeLit.fromStr(str)) |type_lit| {
         state.ctx.addMsg(.{
             .severity = .err,
             .pos = .{ .file = state.file_id, .offset = identifier.start },
-            .data = .{ .name_shadows_type = .{ .found = type_lit } },
+            .data = .{ .name_shadows_type = type_lit },
         });
         return error.IntrinsicShadowing;
     }
     _ = try expect(state, .colon);
 
-    const type_node = try parseType(state);
+    const type_node = parseType(state) catch .poison;
 
     const intern_id = state.ctx.intern_pool.getOrCreateId(str);
     return state.ast.allocNode(.{
@@ -326,14 +334,22 @@ fn parseParam(state: *State) ParseError!Ast.NodeId {
 }
 
 fn parseExpression(state: *State, bind_power: u32) ParseError!Ast.NodeId {
-    var result = switch (state.tokens.peek().tag) {
+    const token = state.tokens.peek();
+    var result = switch (token.tag) {
         .minus => try parseUnaryOp(state, bind_power),
         .key_fn => try parseFnTypeOrLiteral(state),
         .identifier => try parseIdentifier(state),
         .key_undefined => parseUndefLit(state),
         .key_false, .key_true => parseBoolLit(state),
         .num_literal => parseNumLit(state),
-        else => @panic("TODO: handle other kinds of expressions"),
+        else => {
+            state.ctx.addMsg(.{
+                .severity = .err,
+                .pos = .{ .file = state.file_id, .offset = token.start },
+                .data = .expected_expression,
+            });
+            return error.ExpectedExpression;
+        },
     };
 
     while (true) {
@@ -359,7 +375,7 @@ fn parseUnaryOp(state: *State, parent_bind_power: u32) ParseError!Ast.NodeId {
         state.ctx.addMsg(.{
             .severity = .err,
             .pos = .{ .file = state.file_id, .offset = token.start },
-            .data = .{ .unexpected_operator = .{ .found = token.tag } },
+            .data = .unexpected_operator,
         });
         return error.UnexpectedToken;
     }
@@ -478,7 +494,6 @@ fn expect(state: *State, tag: lexer.Tag) ParseError!lexer.Token {
         .pos = .{ .file = state.file_id, .offset = token.start },
         .data = .{ .unexpected_token = .{
             .expected = tag,
-            .found = token.tag,
         } },
     });
     return error.UnexpectedToken;
