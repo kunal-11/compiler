@@ -5,7 +5,7 @@ const debug = stdx.debug;
 const std = @import("std");
 
 const test_module = "testdir/mod1";
-const test_file = "testdir/mod1/main.pnx";
+const test_file = test_module ++ "/main.pnx";
 
 const Context = @import("types.zig").Context;
 const Ast = @import("types.zig").Ast;
@@ -108,10 +108,7 @@ fn loadFile(ctx: *Context, arena: *mem.Arena, ns_id: Namespace.Id, path: []const
 
         for (roots) |root| {
             if (ctx.intern_pool.getOrCreateId(root) == decl.name) {
-                ctx.analysis_q.push(.{ .decl = .{
-                    .file = file_id,
-                    .symbol = symbol_id,
-                } });
+                ctx.analysis_q.push(.{ .decl = symbol_id });
             }
         }
     }

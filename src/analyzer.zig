@@ -17,10 +17,7 @@ const lexer = @import("lexer.zig");
 pub const Queue = struct {
     pub const Item = union(enum) {
         empty,
-        decl: struct {
-            file: File.Id,
-            symbol: Symbol.Id,
-        },
+        decl: Symbol.Id,
         fn_lit: Func.Id,
     };
 
@@ -43,36 +40,29 @@ pub const Queue = struct {
     }
 };
 
-pub const Value = struct {
-    type: Type.Id,
-    val: union(enum) {
-        type: Type.Id,
-        number: i64,
-        boolean: bool,
-        undef: void,
-        fn_lit: Func.Id,
-    },
-};
-
 pub fn analyze(ctx: *Context, arena: *mem.Arena) void {
+    const flusher = mem.Flusher.init(arena);
+    defer flusher.flush();
+
     var item = ctx.analysis_q.pop();
     while (item != .empty) : (item = ctx.analysis_q.pop()) {
         switch (item) {
             .decl => |decl| {
-                const symbol = ctx.symbol_table.get(decl.symbol);
+                const symbol = ctx.symbol_table.get(decl);
                 if (symbol.type_inst != .none) {
                     @panic("TODO: handle type annotations of global decls");
                 }
+                const file = ctx.getFile(symbol.file);
 
-                const result = evalCompBlock(ctx, arena, symbol.file, symbol.value_inst);
-                const file = ctx.getFile(decl.file);
+                const frame = EvalFrame.init(arena, file.untyped_ir.inst_count);
+                const result = evalCompBlock(ctx, arena, symbol.file, symbol.value_inst, frame);
 
                 switch (result.val) {
                     .fn_lit => {
                         const func = ctx.func_table.get(result.val.fn_lit);
                         if (func.status == .unchecked) {
                             ctx.analysis_q.push(.{ .fn_lit = result.val.fn_lit });
-                            func.status = .queued;
+                            func.status = .{ .queued = frame };
                         }
                     },
                     else => {},
@@ -91,22 +81,46 @@ pub fn analyze(ctx: *Context, arena: *mem.Arena) void {
                     arena,
                     func.file,
                     func.untyped_inst,
-                    &.{},
+                    func.status.queued,
                 );
-                func.status = .checked;
-                func.typed_inst = typed_inst;
+                func.status = .{ .checked = typed_inst };
             },
             .empty => unreachable,
         }
     }
 }
 
+pub const Value = struct {
+    type: Type.Id,
+    val: union(enum) {
+        none,
+        undef,
+        type: Type.Id,
+        number: i64,
+        boolean: bool,
+        fn_lit: Func.Id,
+    },
+};
+
+pub const EvalFrame = struct {
+    results: []Value,
+
+    pub fn init(arena: *mem.Arena, result_len: usize) *EvalFrame {
+        const frame = arena.pushStruct(EvalFrame);
+        frame.* = .{
+            .results = arena.pushArray(Value, result_len),
+        };
+        for (frame.results) |*r| r.* = .{ .type = .none, .val = .none };
+        return frame;
+    }
+};
+
 fn lowerFnLit(
     ctx: *Context,
     arena: *mem.Arena,
     file_id: File.Id,
     lit_id: UntypedIr.InstId,
-    results: []Value,
+    frame: *EvalFrame,
 ) TypedIr.InstId {
     const file = ctx.getFile(file_id);
 
@@ -115,7 +129,7 @@ fn lowerFnLit(
 
     for (0..lit.data.fn_lit.body.count) |inst_idx| {
         const inst_id = file.untyped_ir.extras[lit.data.fn_lit.body.offset + inst_idx];
-        const res = evaluateInst(ctx, arena, file_id, results, inst_id, .execute);
+        const res = evaluateInst(ctx, arena, file_id, frame, inst_id, .emit);
         switch (res) {
             .brk => return .none,
             else => {},
@@ -130,50 +144,83 @@ fn evalCompBlock(
     arena: *mem.Arena,
     file_id: File.Id,
     block_id: UntypedIr.InstId,
+    frame: *EvalFrame,
 ) Value {
     const file = ctx.getFile(file_id);
-
-    const results = arena.pushArray(Value, file.untyped_ir.inst_count);
-    // just for safety check
-    for (results) |*r| r.* = .{ .type = .none, .val = undefined };
-
     const block = file.untyped_ir.getInst(block_id);
     debug.assert(block.tag == .comp_block, "evaluate not a comp block");
 
     for (0..block.data.block.count) |inst_idx| {
         const inst_id = file.untyped_ir.extras[block.data.block.offset + inst_idx];
-        const res = evaluateInst(ctx, arena, file_id, results, inst_id, .execute);
+        const res = evaluateInst(ctx, arena, file_id, frame, inst_id, .execute);
         switch (res) {
-            .brk => return results[@backingInt(inst_id)],
-            else => {},
+            .value => |val| frame.results[@backingInt(inst_id)] = val,
+            // TODO: handle multi level breaks
+            .brk => |brk| return frame.results[@backingInt(brk.val)],
+            .ret => @panic("TODO"),
         }
     }
-
     @panic("Eval: block did not break");
 }
 
-const EvalResult = enum { success, brk };
+const EvalResult = union(enum) {
+    value: Value,
+    ret: struct { val: UntypedIr.InstId },
+    brk: struct { val: UntypedIr.InstId, block: UntypedIr.InstId },
+};
 
 fn evaluateInst(
     ctx: *Context,
     arena: *mem.Arena,
     file_id: File.Id,
-    results: []Value,
+    frame: *EvalFrame,
     inst_id: UntypedIr.InstId,
     mode: enum { emit, execute },
 ) EvalResult {
     _ = mode;
     const file = ctx.getFile(file_id);
     const inst = file.untyped_ir.getInst(inst_id);
-    var result = EvalResult.success;
-
-    results[@backingInt(inst_id)] = switch (inst.tag) {
-        .type_lit => blk: {
-            break :blk .{
-                .type = getTypeId(ctx, .type_id),
-                .val = .{ .type = getTypeId(ctx, inst.data.type_lit) },
-            };
+    const results = frame.results;
+    return switch (inst.tag) {
+        .type_lit => .{ .value = .{
+            .type = getTypeId(ctx, .type_id),
+            .val = .{ .type = getTypeId(ctx, inst.data.type_lit) },
+        } },
+        .undef_lit => .{ .value = .{
+            .type = getTypeId(ctx, .comp_undef),
+            .val = .undef,
+        } },
+        .num_lit => blk: {
+            const num_token = lexer.lexToken(file.contents, inst.pos);
+            debug.assert(num_token.tag == .num_literal, "num lit lexed token invalid");
+            const num_str = file.contents[num_token.start..num_token.end];
+            const num = math.parseInt(i64, num_str) catch @panic("TODO: handle invalid num");
+            break :blk .{ .value = .{
+                .type = getTypeId(ctx, .comp_int),
+                .val = .{ .number = num },
+            } };
         },
+        .bool_lit => .{ .value = .{
+            .type = getTypeId(ctx, .bool),
+            .val = .{ .boolean = inst.data.bool_lit },
+        } },
+
+        .type_of => .{ .value = .{
+            .type = getTypeId(ctx, .type_id),
+            .val = .{ .type = results[@backingInt(inst.data.unary_op)].type },
+        } },
+
+        .alloc, .load, .store => @panic("TODO: runtime instructions"),
+
+        .global_val, .global_ptr => @panic("TODO: global name resolve"),
+
+        .brk => blk: {
+            break :blk .{ .brk = .{
+                .val = inst.data.bin_op.rhs,
+                .block = inst.data.bin_op.lhs,
+            } };
+        },
+
         .fn_type => blk: {
             const flusher = mem.Flusher.init(arena);
             defer flusher.flush();
@@ -189,44 +236,27 @@ fn evaluateInst(
                 .tag = .func,
                 .data = .{ .func = .{ .ret = ret, .args = ctx.type_pool.allocList(args) } },
             });
-            break :blk .{
+            break :blk .{ .value = .{
                 .type = getTypeId(ctx, .type_id),
                 .val = .{ .type = constant_id },
-            };
+            } };
         },
-        .num_lit => blk: {
-            const num_token = lexer.lexToken(file.contents, inst.pos);
-            debug.assert(num_token.tag == .num_literal, "num lit lexed token invalid");
-            const num_str = file.contents[num_token.start..num_token.end];
-            const num = math.parseInt(i64, num_str) catch @panic("TODO: handle invalid num");
-            break :blk .{
-                .type = getTypeId(ctx, .comp_int),
-                .val = .{ .number = num },
-            };
-        },
-        .brk => blk: {
-            result = .brk;
-            break :blk results[@backingInt(inst.data.bin_op.rhs)];
-        },
-
         .fn_lit => blk: {
             const type_res = results[@backingInt(inst.data.fn_lit.type)];
             const func_id = ctx.func_table.add(.{
                 .file = file_id,
-                .status = .unchecked,
                 .type = type_res.val.type,
                 .untyped_inst = inst_id,
-                .typed_inst = .none,
+                .status = .unchecked,
             });
-            break :blk .{
+            break :blk .{ .value = .{
                 .type = type_res.val.type,
                 .val = .{ .fn_lit = func_id },
-            };
+            } };
         },
 
         else => @panic("TODO: eval other instructions"),
     };
-    return result;
 }
 
 fn getTypeId(ctx: *Context, lit: TypeLit) Type.Id {

@@ -375,7 +375,7 @@ fn parseUnaryOp(state: *State, parent_bind_power: u32) ParseError!Ast.NodeId {
         state.ctx.addMsg(.{
             .severity = .err,
             .pos = .{ .file = state.file_id, .offset = token.start },
-            .data = .unexpected_operator,
+            .data = .expected_operator,
         });
         return error.UnexpectedToken;
     }

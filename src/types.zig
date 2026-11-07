@@ -17,7 +17,7 @@ pub const Message = struct {
     severity: Severity,
     pos: Position,
     data: union(enum) {
-        unexpected_operator,
+        expected_operator,
         expected_binding_op,
         expected_expression,
         expected_type,
@@ -200,6 +200,7 @@ pub const TypeLit = enum(u32) {
 
     comp_int,
     comp_float,
+    comp_undef,
 
     bool,
     void,
@@ -587,12 +588,14 @@ pub const Type = struct {
 pub const Func = struct {
     pub const Id = enum(u32) { none = 0, _ };
 
-    status: enum { unchecked, queued, checked },
-
     type: Type.Id,
     file: File.Id,
     untyped_inst: UntypedIr.InstId,
-    typed_inst: TypedIr.InstId,
+    status: union(enum) {
+        unchecked,
+        queued: *analyzer.EvalFrame,
+        checked: TypedIr.InstId,
+    },
 
     pub const Table = struct {
         const max_funcs = 4096;
