@@ -8,8 +8,9 @@ const UntypedIr = @import("types.zig").UntypedIr;
 const TypedIr = @import("types.zig").TypedIr;
 const File = @import("types.zig").File;
 const TypeLit = @import("types.zig").TypeLit;
-const Constant = @import("types.zig").Constant;
 const Symbol = @import("types.zig").Symbol;
+const Type = @import("types.zig").Type;
+const Func = @import("types.zig").Func;
 
 const lexer = @import("lexer.zig");
 
@@ -20,7 +21,7 @@ pub const Queue = struct {
             file: File.Id,
             symbol: Symbol.Id,
         },
-        fn_lit: Constant.Id,
+        fn_lit: Func.Id,
     };
 
     const len = 1024;
@@ -43,13 +44,13 @@ pub const Queue = struct {
 };
 
 pub const Value = struct {
-    type: Constant.Id,
+    type: Type.Id,
     val: union(enum) {
-        type: Constant.Id,
+        type: Type.Id,
         number: i64,
         boolean: bool,
         undef: void,
-        fn_lit: Constant.Id,
+        fn_lit: Func.Id,
     },
 };
 
@@ -63,16 +64,15 @@ pub fn analyze(ctx: *Context, arena: *mem.Arena) void {
                     @panic("TODO: handle type annotations of global decls");
                 }
 
-                const result_id = evaluate(ctx, arena, symbol.file, symbol.value_inst);
+                const result = evalCompBlock(ctx, arena, symbol.file, symbol.value_inst);
                 const file = ctx.getFile(decl.file);
-                const result = file.analysis[@backingInt(result_id)];
 
                 switch (result.val) {
                     .fn_lit => {
-                        const entry = ctx.constants.getSideEntry(result.val.fn_lit);
-                        if (entry.fn_lit == .unchecked) {
+                        const func = ctx.func_table.get(result.val.fn_lit);
+                        if (func.status == .unchecked) {
                             ctx.analysis_q.push(.{ .fn_lit = result.val.fn_lit });
-                            entry.* = .{ .fn_lit = .queued };
+                            func.status = .queued;
                         }
                     },
                     else => {},
@@ -84,122 +84,154 @@ pub fn analyze(ctx: *Context, arena: *mem.Arena) void {
                 debug.log("analyzed value: {s} = {}", .{ name_str, result });
             },
             .fn_lit => |lit| {
-                const data = ctx.constants.get(lit);
-                debug.assert(
-                    ctx.constants.getSideEntry(lit).fn_lit == .queued,
-                    "fn check item invalid status",
+                const func = ctx.func_table.get(lit);
+                debug.assert(func.status == .queued, "fn check item invalid status");
+                const typed_inst = lowerFnLit(
+                    ctx,
+                    arena,
+                    func.file,
+                    func.untyped_inst,
+                    &.{},
                 );
-                const typed_inst = typeCheckFn(ctx, data.data.fn_lit.file, data.data.fn_lit.inst);
-                ctx.constants.getSideEntry(lit).* = .{ .fn_lit = .{ .checked = typed_inst } };
+                func.status = .checked;
+                func.typed_inst = typed_inst;
             },
             .empty => unreachable,
         }
     }
 }
 
-fn evaluate(
+fn lowerFnLit(
+    ctx: *Context,
+    arena: *mem.Arena,
+    file_id: File.Id,
+    lit_id: UntypedIr.InstId,
+    results: []Value,
+) TypedIr.InstId {
+    const file = ctx.getFile(file_id);
+
+    const lit = file.untyped_ir.getInst(lit_id);
+    debug.assert(lit.tag == .fn_lit, "lower not a fn lit");
+
+    for (0..lit.data.fn_lit.body.count) |inst_idx| {
+        const inst_id = file.untyped_ir.extras[lit.data.fn_lit.body.offset + inst_idx];
+        const res = evaluateInst(ctx, arena, file_id, results, inst_id, .execute);
+        switch (res) {
+            .brk => return .none,
+            else => {},
+        }
+    }
+
+    @panic("TODO");
+}
+
+fn evalCompBlock(
     ctx: *Context,
     arena: *mem.Arena,
     file_id: File.Id,
     block_id: UntypedIr.InstId,
-) UntypedIr.InstId {
+) Value {
     const file = ctx.getFile(file_id);
 
-    if (file.analysis.len == 0) {
-        file.analysis = file.arena.pushArray(Value, file.untyped_ir.inst_count);
-        // just for safety check ?
-        for (file.analysis) |*r| r.* = .{ .type = .none, .val = undefined };
-    }
-    const results = file.analysis;
+    const results = arena.pushArray(Value, file.untyped_ir.inst_count);
+    // just for safety check
+    for (results) |*r| r.* = .{ .type = .none, .val = undefined };
 
     const block = file.untyped_ir.getInst(block_id);
     debug.assert(block.tag == .comp_block, "evaluate not a comp block");
 
-    for (block.data.block) |inst_id| {
-        const inst = file.untyped_ir.getInst(inst_id);
-        results[@backingInt(inst_id)] = switch (inst.tag) {
-            .type_lit => blk: {
-                break :blk .{
-                    .type = getTypeId(ctx, .type_id),
-                    .val = .{ .type = getTypeId(ctx, inst.data.type_lit) },
-                };
-            },
-            .fn_type => blk: {
-                const flusher1 = mem.Flusher.init(arena);
-                defer flusher1.flush();
-
-                const ret = results[@backingInt(inst.data.fn_type.return_type)].val.type;
-                const args = arena.pushArray(Constant.Id, inst.data.fn_type.arg_types.len);
-                for (inst.data.fn_type.arg_types, 0..) |arg, i| {
-                    args[i] = results[@backingInt(arg)].val.type;
-                }
-
-                const constant_id = ctx.constants.getOrAddId(.{
-                    .tag = .fn_type,
-                    .data = .{ .fn_type = .{ .ret = ret, .args = args } },
-                });
-                break :blk .{
-                    .type = getTypeId(ctx, .type_id),
-                    .val = .{ .type = constant_id },
-                };
-            },
-            .num_lit => blk: {
-                const num_token = lexer.lexToken(file.contents, inst.pos);
-                debug.assert(num_token.tag == .num_literal, "num lit lexed token invalid");
-                const num_str = file.contents[num_token.start..num_token.end];
-                const num = math.parseInt(i64, num_str) catch @panic("TODO: handle invalid num");
-                break :blk .{
-                    .type = getTypeId(ctx, .comp_int),
-                    .val = .{ .number = num },
-                };
-            },
-            .brk => return inst.data.bin_op.rhs,
-
-            .fn_lit => blk: {
-                const type_res = file.analysis[@backingInt(inst.data.fn_lit.type)];
-                break :blk .{
-                    .type = type_res.val.type,
-                    .val = .{ .fn_lit = addFnLitConstant(ctx, file_id, inst_id) },
-                };
-            },
-
-            else => @panic("TODO: eval other instructions"),
-        };
+    for (0..block.data.block.count) |inst_idx| {
+        const inst_id = file.untyped_ir.extras[block.data.block.offset + inst_idx];
+        const res = evaluateInst(ctx, arena, file_id, results, inst_id, .execute);
+        switch (res) {
+            .brk => return results[@backingInt(inst_id)],
+            else => {},
+        }
     }
 
-    @panic("Eval: compile block did not break");
+    @panic("Eval: block did not break");
 }
 
-fn addFnLitConstant(ctx: *Context, file: File.Id, inst: UntypedIr.InstId) Constant.Id {
-    const const_id = ctx.constants.getOrAddId(.{
-        .tag = .fn_lit,
-        .data = .{ .fn_lit = .{ .file = file, .inst = inst } },
-    });
-    const entry = ctx.constants.getSideEntry(const_id);
-    if (entry.* == .empty) {
-        entry.* = .{ .fn_lit = .unchecked };
-    }
-    return const_id;
-}
+const EvalResult = enum { success, brk };
 
-fn getTypeId(ctx: *Context, lit: TypeLit) Constant.Id {
-    return ctx.constants.getOrAddId(.{
-        .tag = .type_lit,
-        .data = .{ .type_lit = lit },
-    });
-}
-
-fn typeCheckFn(ctx: *Context, file_id: File.Id, inst_id: UntypedIr.InstId) TypedIr.InstId {
+fn evaluateInst(
+    ctx: *Context,
+    arena: *mem.Arena,
+    file_id: File.Id,
+    results: []Value,
+    inst_id: UntypedIr.InstId,
+    mode: enum { emit, execute },
+) EvalResult {
+    _ = mode;
     const file = ctx.getFile(file_id);
-    const lit = file.untyped_ir.getInst(inst_id).data.fn_lit;
+    const inst = file.untyped_ir.getInst(inst_id);
+    var result = EvalResult.success;
 
-    const type_id = file.analysis[@backingInt(lit.type)].val.type;
-    const type_val = ctx.constants.get(type_id);
-    debug.assert(type_val.tag == .fn_type, "fn type invalid");
+    results[@backingInt(inst_id)] = switch (inst.tag) {
+        .type_lit => blk: {
+            break :blk .{
+                .type = getTypeId(ctx, .type_id),
+                .val = .{ .type = getTypeId(ctx, inst.data.type_lit) },
+            };
+        },
+        .fn_type => blk: {
+            const flusher = mem.Flusher.init(arena);
+            defer flusher.flush();
 
-    debug.log("type checking fn with type: {}", .{type_val.data.fn_type});
-    for (lit.body) |inst| {
-        _ = inst;
-    }
-    return .none;
+            const ret = results[@backingInt(inst.data.fn_type.return_type)].val.type;
+            const args = arena.pushArray(Type.Id, inst.data.fn_type.arg_types.count);
+            for (0..inst.data.fn_type.arg_types.count) |i| {
+                const arg = file.untyped_ir.extras[inst.data.fn_type.arg_types.offset + i];
+                args[i] = results[@backingInt(arg)].val.type;
+            }
+
+            const constant_id = ctx.type_pool.getOrCreateId(.{
+                .tag = .func,
+                .data = .{ .func = .{ .ret = ret, .args = ctx.type_pool.allocList(args) } },
+            });
+            break :blk .{
+                .type = getTypeId(ctx, .type_id),
+                .val = .{ .type = constant_id },
+            };
+        },
+        .num_lit => blk: {
+            const num_token = lexer.lexToken(file.contents, inst.pos);
+            debug.assert(num_token.tag == .num_literal, "num lit lexed token invalid");
+            const num_str = file.contents[num_token.start..num_token.end];
+            const num = math.parseInt(i64, num_str) catch @panic("TODO: handle invalid num");
+            break :blk .{
+                .type = getTypeId(ctx, .comp_int),
+                .val = .{ .number = num },
+            };
+        },
+        .brk => blk: {
+            result = .brk;
+            break :blk results[@backingInt(inst.data.bin_op.rhs)];
+        },
+
+        .fn_lit => blk: {
+            const type_res = results[@backingInt(inst.data.fn_lit.type)];
+            const func_id = ctx.func_table.add(.{
+                .file = file_id,
+                .status = .unchecked,
+                .type = type_res.val.type,
+                .untyped_inst = inst_id,
+                .typed_inst = .none,
+            });
+            break :blk .{
+                .type = type_res.val.type,
+                .val = .{ .fn_lit = func_id },
+            };
+        },
+
+        else => @panic("TODO: eval other instructions"),
+    };
+    return result;
+}
+
+fn getTypeId(ctx: *Context, lit: TypeLit) Type.Id {
+    return ctx.type_pool.getOrCreateId(.{
+        .tag = .lit,
+        .data = .{ .lit = lit },
+    });
 }

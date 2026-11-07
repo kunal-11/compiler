@@ -127,7 +127,7 @@ pub fn parseFile(ctx: *Context, arena: *mem.Arena, file_id: File.Id) Ast.NodeId 
     return state.ast.allocNode(.{
         .pos = 0,
         .tag = .file,
-        .data = .{ .block = state.node_stack[0..state.node_count] },
+        .data = .{ .block = state.ast.allocList(state.node_stack[0..state.node_count]) },
     });
 }
 
@@ -211,7 +211,7 @@ fn parseBlock(state: *State) ParseError!Ast.NodeId {
     return state.ast.allocNode(.{
         .pos = open_token.start,
         .tag = .block,
-        .data = .{ .block = state.node_stack[node_marker..state.node_count] },
+        .data = .{ .block = state.ast.allocList(state.node_stack[node_marker..state.node_count]) },
     });
 }
 
@@ -294,7 +294,7 @@ fn parseFnType(state: *State) ParseError!Ast.NodeId {
     const args_node = state.ast.allocNode(.{
         .pos = paren_node.start,
         .tag = .params,
-        .data = .{ .block = state.node_stack[node_marker..state.node_count] },
+        .data = .{ .block = state.ast.allocList(state.node_stack[node_marker..state.node_count]) },
     });
 
     return state.ast.allocNode(.{

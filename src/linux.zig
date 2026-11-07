@@ -72,7 +72,6 @@ fn loadFile(ctx: *Context, arena: *mem.Arena, ns_id: Namespace.Id, path: []const
         .ast = ast,
         .untyped_ir = untyped_ir,
         .typed_ir = typed_ir,
-        .analysis = &.{},
     });
 
     const root_node = parser.parseFile(ctx, arena, file_id);

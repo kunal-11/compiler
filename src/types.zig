@@ -52,8 +52,10 @@ pub const Context = struct {
     msg_count: u32 = 0,
 
     symbol_table: Symbol.Table = .{},
+    func_table: Func.Table = .{},
+
+    type_pool: Type.Pool = .{},
     analysis_q: analyzer.Queue = .{},
-    constants: Constant.Pool = .{},
 
     pub fn addMsg(ctx: *Context, msg: Message) void {
         ctx.msgs[ctx.msg_count] = msg;
@@ -87,10 +89,7 @@ pub const Context = struct {
 };
 
 pub const File = struct {
-    const max_fns = 1024;
-
     pub const Id = enum(u32) { none = 0, _ };
-    pub const FnId = enum(u32) { none = 0, _ };
 
     arena: mem.Arena,
     path: []const u8,
@@ -99,8 +98,6 @@ pub const File = struct {
     ast: *Ast,
     untyped_ir: *UntypedIr,
     typed_ir: *TypedIr,
-
-    analysis: []analyzer.Value,
 };
 
 pub const Namespace = struct {
@@ -284,11 +281,13 @@ pub const Ast = struct {
         assign,
     };
 
+    pub const List = struct { offset: u32, count: u32 };
+
     pub const Node = struct {
         pos: u32,
         tag: Tag,
         data: union {
-            block: []NodeId,
+            block: List,
 
             identifier: struct { intern_id: InternPool.Id },
 
@@ -309,161 +308,36 @@ pub const Ast = struct {
     };
 
     pub fn allocNode(ast: *Ast, node: Node) NodeId {
-        const packed_node: PackedNode = switch (node.tag) {
-            .identifier => .{
-                .pos = node.pos,
-                .tag = node.tag,
-                .lhs = @backingInt(node.data.identifier.intern_id),
-                .rhs = 0,
-            },
-
-            .type_lit => .{
-                .pos = node.pos,
-                .tag = node.tag,
-                .lhs = @backingInt(node.data.type_lit),
-                .rhs = 0,
-            },
-            .bool_lit => .{
-                .pos = node.pos,
-                .tag = node.tag,
-                .lhs = if (node.data.bool_lit) 1 else 0,
-                .rhs = 0,
-            },
-            .num_lit, .undef_lit => .{
-                .pos = node.pos,
-                .tag = node.tag,
-                .lhs = 0,
-                .rhs = 0,
-            },
-
-            .fn_type => .{
-                .pos = node.pos,
-                .tag = node.tag,
-                .lhs = @backingInt(node.data.fn_type.args),
-                .rhs = @backingInt(node.data.fn_type.return_type),
-            },
-            .fn_lit => .{
-                .pos = node.pos,
-                .tag = node.tag,
-                .lhs = @backingInt(node.data.fn_lit.fn_type),
-                .rhs = @backingInt(node.data.fn_lit.block),
-            },
-
-            .block, .params, .file => blk: {
-                const block = node.data.block;
-                const extra_offset = ast.extra_count;
-                for (block) |child| {
-                    ast.extras[ast.extra_count] = @backingInt(child);
-                    ast.extra_count += 1;
-                }
-                break :blk .{
-                    .pos = node.pos,
-                    .tag = node.tag,
-                    .lhs = extra_offset,
-                    .rhs = @intCast(block.len),
-                };
-            },
-
-            .param => .{
-                .pos = node.pos,
-                .tag = node.tag,
-                .lhs = @backingInt(node.data.param.intern_id),
-                .rhs = @backingInt(node.data.param.type),
-            },
-
-            .const_decl, .var_decl => .{
-                .pos = node.pos,
-                .tag = node.tag,
-                .lhs = @backingInt(node.data.decl.param),
-                .rhs = @backingInt(node.data.decl.value),
-            },
-
-            .negate, .ret => .{
-                .pos = node.pos,
-                .tag = node.tag,
-                .lhs = @backingInt(node.data.unary_op),
-                .rhs = 0,
-            },
-
-            .add, .subtract, .mul, .div, .mod, .assign => .{
-                .pos = node.pos,
-                .tag = node.tag,
-                .lhs = @backingInt(node.data.bin_op.lhs),
-                .rhs = @backingInt(node.data.bin_op.rhs),
-            },
-        };
         const result = ast.node_count;
-        ast.nodes[result] = packed_node;
+        ast.nodes[result] = node;
         ast.node_count += 1;
         return @fromBackingInt(result);
     }
 
     pub fn getNode(ast: *Ast, id: NodeId) Node {
-        const node = ast.nodes[@backingInt(id)];
-        return .{
-            .pos = node.pos,
-            .tag = node.tag,
-            .data = switch (node.tag) {
-                .identifier => .{ .identifier = .{
-                    .intern_id = @fromBackingInt(node.lhs),
-                } },
-
-                .bool_lit => .{ .bool_lit = node.lhs == 1 },
-                .undef_lit => .{ .empty = {} },
-                .type_lit => .{ .type_lit = @fromBackingInt(node.lhs) },
-
-                .fn_type => .{ .fn_type = .{
-                    .args = @fromBackingInt(node.lhs),
-                    .return_type = @fromBackingInt(node.rhs),
-                } },
-                .fn_lit => .{ .fn_lit = .{
-                    .fn_type = @fromBackingInt(node.lhs),
-                    .block = @fromBackingInt(node.rhs),
-                } },
-
-                .block, .params, .file => blk: {
-                    const first_node: [*]NodeId = @ptrCast(&ast.extras[node.lhs]);
-                    break :blk .{ .block = first_node[0..node.rhs] };
-                },
-
-                .param => .{ .param = .{
-                    .intern_id = @fromBackingInt(node.lhs),
-                    .type = @fromBackingInt(node.rhs),
-                } },
-
-                .const_decl, .var_decl => .{ .decl = .{
-                    .param = @fromBackingInt(node.lhs),
-                    .value = @fromBackingInt(node.rhs),
-                } },
-
-                .negate, .ret => .{ .unary_op = @fromBackingInt(node.lhs) },
-
-                .add, .subtract, .mul, .div, .mod, .assign => .{ .bin_op = .{
-                    .lhs = @fromBackingInt(node.lhs),
-                    .rhs = @fromBackingInt(node.rhs),
-                } },
-
-                .num_lit => .{ .empty = {} },
-            },
-        };
+        debug.assert(id != .none, "get none ast node");
+        debug.assert(id != .poison, "get poison ast node");
+        return ast.nodes[@backingInt(id)];
     }
 
-    const PackedNode = struct {
-        pos: u32,
-        tag: Tag,
-        lhs: u32,
-        rhs: u32,
-    };
+    pub fn allocList(ast: *Ast, ids: []NodeId) List {
+        const offset = ast.extra_count;
+        for (ids) |id| {
+            ast.extras[ast.extra_count] = id;
+            ast.extra_count += 1;
+        }
+        return .{ .offset = offset, .count = @intCast(ids.len) };
+    }
 
     pub const NodeId = enum(u32) { none = 0, poison = 1, _ };
 
     const max_nodes = 8192;
     const max_extras = 4096;
 
-    nodes: [max_nodes]PackedNode = undefined,
+    nodes: [max_nodes]Node = undefined,
     node_count: u32 = 2,
 
-    extras: [max_extras]u32 = undefined,
+    extras: [max_extras]NodeId = undefined,
     extra_count: u32 = 0,
 };
 
@@ -507,12 +381,17 @@ pub const UntypedIr = struct {
         negate,
     };
 
+    pub const List = struct {
+        offset: u32,
+        count: u32,
+    };
+
     pub const Inst = struct {
         pos: u32,
         tag: Tag,
         data: union {
             empty: void,
-            block: []InstId,
+            block: List,
 
             type_lit: TypeLit,
             bool_lit: bool,
@@ -520,192 +399,49 @@ pub const UntypedIr = struct {
             global_ref: InternPool.Id,
 
             fn_arg: struct { index: u32 },
-            fn_lit: struct { type: InstId, body: []InstId },
-            fn_type: struct { return_type: InstId, arg_types: []InstId },
+            fn_lit: struct { type: InstId, body: List },
+            fn_type: struct { return_type: InstId, arg_types: List },
 
             bin_op: struct { lhs: InstId, rhs: InstId },
             unary_op: InstId,
         },
     };
 
-    const PackedInst = struct {
-        tag: Tag,
-        pos: u32,
-        lhs: u32,
-        rhs: u32,
-    };
-
-    fn packInst(ir: *UntypedIr, inst: Inst) PackedInst {
-        return switch (inst.tag) {
-            .block, .comp_block => blk: {
-                const extra_offset = ir.extra_count;
-                for (inst.data.block) |child| {
-                    ir.extras[ir.extra_count] = @backingInt(child);
-                    ir.extra_count += 1;
-                }
-                break :blk .{
-                    .pos = inst.pos,
-                    .tag = inst.tag,
-                    .lhs = extra_offset,
-                    .rhs = @intCast(inst.data.block.len),
-                };
-            },
-
-            .global_ptr, .global_val => .{
-                .pos = inst.pos,
-                .tag = inst.tag,
-                .lhs = @backingInt(inst.data.global_ref),
-                .rhs = 0,
-            },
-
-            .reserved, .num_lit, .undef_lit => .{
-                .pos = inst.pos,
-                .tag = inst.tag,
-                .lhs = 0,
-                .rhs = 0,
-            },
-            .bool_lit => .{
-                .pos = inst.pos,
-                .tag = inst.tag,
-                .lhs = if (inst.data.bool_lit) 1 else 0,
-                .rhs = 0,
-            },
-            .type_lit => .{
-                .pos = inst.pos,
-                .tag = inst.tag,
-                .lhs = @backingInt(inst.data.type_lit),
-                .rhs = 0,
-            },
-
-            .fn_lit => blk: {
-                const extra_offset = ir.extra_count;
-                ir.extras[ir.extra_count] = @backingInt(inst.data.fn_lit.type);
-                ir.extra_count += 1;
-                for (inst.data.fn_lit.body) |child| {
-                    ir.extras[ir.extra_count] = @backingInt(child);
-                    ir.extra_count += 1;
-                }
-                break :blk .{
-                    .pos = inst.pos,
-                    .tag = inst.tag,
-                    .lhs = @intCast(inst.data.fn_lit.body.len),
-                    .rhs = extra_offset,
-                };
-            },
-            .fn_type => blk: {
-                const extra_offset = ir.extra_count;
-                ir.extras[ir.extra_count] = @backingInt(inst.data.fn_type.return_type);
-                ir.extra_count += 1;
-
-                for (inst.data.fn_type.arg_types) |child| {
-                    ir.extras[ir.extra_count] = @backingInt(child);
-                    ir.extra_count += 1;
-                }
-
-                break :blk .{
-                    .pos = inst.pos,
-                    .tag = inst.tag,
-                    .lhs = @intCast(inst.data.fn_type.arg_types.len),
-                    .rhs = extra_offset,
-                };
-            },
-            .fn_arg => .{
-                .pos = inst.pos,
-                .tag = inst.tag,
-                .lhs = inst.data.fn_arg.index,
-                .rhs = 0,
-            },
-
-            .add, .subtract, .mul, .div, .mod, .alloc, .store, .brk => .{
-                .pos = inst.pos,
-                .tag = inst.tag,
-                .lhs = @backingInt(inst.data.bin_op.lhs),
-                .rhs = @backingInt(inst.data.bin_op.rhs),
-            },
-
-            .load, .type_of, .negate, .ret, .ret_implicit, .brk_implicit => .{
-                .pos = inst.pos,
-                .tag = inst.tag,
-                .lhs = @backingInt(inst.data.unary_op),
-                .rhs = 0,
-            },
-        };
-    }
-
-    fn unpackInst(ir: *UntypedIr, inst: PackedInst) Inst {
-        return .{
-            .pos = inst.pos,
-            .tag = inst.tag,
-            .data = switch (inst.tag) {
-                .block, .comp_block => blk: {
-                    const first_inst: [*]InstId = @ptrCast(&ir.extras[inst.lhs]);
-                    break :blk .{ .block = first_inst[0..inst.rhs] };
-                },
-
-                .global_ptr, .global_val => .{ .global_ref = @fromBackingInt(inst.lhs) },
-
-                .reserved, .num_lit, .undef_lit => .{ .empty = {} },
-                .bool_lit => .{ .bool_lit = inst.lhs == 1 },
-                .type_lit => .{ .type_lit = @fromBackingInt(inst.lhs) },
-
-                .fn_lit => blk: {
-                    const body: [*]InstId = @ptrCast(&ir.extras[inst.rhs + 1]);
-                    break :blk .{ .fn_lit = .{
-                        .type = @fromBackingInt(ir.extras[inst.rhs]),
-                        .body = body[0..inst.lhs],
-                    } };
-                },
-                .fn_type => blk: {
-                    const args: [*]InstId = @ptrCast(&ir.extras[inst.rhs + 1]);
-                    break :blk .{ .fn_type = .{
-                        .return_type = @fromBackingInt(ir.extras[inst.rhs]),
-                        .arg_types = args[0..inst.lhs],
-                    } };
-                },
-                .fn_arg => .{ .fn_arg = .{
-                    .index = inst.lhs,
-                } },
-
-                .add, .subtract, .mul, .div, .mod, .alloc, .store, .brk => .{
-                    .bin_op = .{
-                        .lhs = @fromBackingInt(inst.lhs),
-                        .rhs = @fromBackingInt(inst.rhs),
-                    },
-                },
-
-                .load, .type_of, .negate, .ret, .ret_implicit, .brk_implicit => .{
-                    .unary_op = @fromBackingInt(inst.lhs),
-                },
-            },
-        };
-    }
-
     pub const InstId = enum(u32) { none = 0, poison = 1, _ };
 
     const max_insts = 8192;
     const max_extras = 8192;
 
-    insts: [max_insts]PackedInst = undefined,
+    insts: [max_insts]Inst = undefined,
     inst_count: u32 = 2,
 
-    extras: [max_extras]u32 = undefined,
+    extras: [max_extras]InstId = undefined,
     extra_count: u32 = 0,
 
     pub fn getInst(ir: *UntypedIr, id: InstId) Inst {
         debug.assert(id != .none, "get none untyped inst");
-        const inst = ir.insts[@backingInt(id)];
-        return ir.unpackInst(inst);
+        debug.assert(id != .poison, "get poison untyped inst");
+        return ir.insts[@backingInt(id)];
     }
 
     pub fn overwriteInst(ir: *UntypedIr, id: InstId, inst: Inst) void {
-        ir.insts[@backingInt(id)] = ir.packInst(inst);
+        ir.insts[@backingInt(id)] = inst;
     }
 
     pub fn allocInst(ir: *UntypedIr, inst: Inst) InstId {
         const result = ir.inst_count;
-        ir.insts[result] = ir.packInst(inst);
+        ir.insts[result] = inst;
         ir.inst_count += 1;
         return @fromBackingInt(result);
+    }
+
+    pub fn allocList(ir: *UntypedIr, ids: []InstId) List {
+        const offset = ir.extra_count;
+        for (ids) |id| {
+            ir.extras[ir.extra_count] = id;
+            ir.extra_count += 1;
+        }
+        return .{ .offset = offset, .count = @intCast(ids.len) };
     }
 };
 
@@ -723,254 +459,157 @@ pub const TypedIr = struct {
         pos: u32,
         tag: Tag,
         data: union {
-            arg: struct { index: u32, type: Constant.Id },
-
-            constant: Constant.Id,
+            arg: struct { index: u32, type: Type.Id },
 
             bin_op: struct { lhs: InstId, rhs: InstId },
         },
     };
 
-    const PackedInst = struct {
-        pos: u32,
-        tag: Tag,
-        lhs: u32,
-        rhs: u32,
-    };
-
-    fn packInst(ir: *TypedIr, inst: Inst) PackedInst {
-        _ = ir;
-        return switch (inst.tag) {
-            .arg => .{
-                .pos = inst.pos,
-                .tag = inst.tag,
-                .lhs = inst.data.arg.index,
-                .rhs = @backingInt(inst.data.arg.type),
-            },
-
-            .constant => .{
-                .pos = inst.pos,
-                .tag = inst.tag,
-                .lhs = @backingInt(inst.data.constant),
-                .rhs = 0,
-            },
-
-            .add => .{
-                .pos = inst.pos,
-                .tag = inst.tag,
-                .lhs = @backingInt(inst.data.bin_op.lhs),
-                .rhs = @backingInt(inst.data.bin_op.rhs),
-            },
-        };
-    }
-
-    fn unpackInst(ir: *TypedIr, inst: PackedInst) Inst {
-        _ = ir;
-        return .{
-            .pos = inst.pos,
-            .tag = inst.tag,
-            .data = switch (inst.tag) {
-                .arg => .{ .arg = .{
-                    .index = inst.lhs,
-                    .type = @fromBackingInt(inst.rhs),
-                } },
-                .constant => .{ .constant = @fromBackingInt(inst.lhs) },
-                .add => .{ .bin_op = .{
-                    .lhs = @fromBackingInt(inst.lhs),
-                    .rhs = @fromBackingInt(inst.rhs),
-                } },
-            },
-        };
-    }
-
     const max_insts = 8192;
 
-    insts: [max_insts]PackedInst = undefined,
+    insts: [max_insts]Inst = undefined,
     inst_count: u32 = 1,
 
     pub fn getInst(ir: *TypedIr, id: InstId) Inst {
         debug.assert(id != .none, "get none typed inst");
-        const inst = ir.insts[@backingInt(id)];
-        return ir.unpackInst(inst);
+        return ir.insts[@backingInt(id)];
     }
 
     pub fn allocInst(ir: *TypedIr, inst: Inst) InstId {
         const result = ir.inst_count;
-        ir.insts[result] = ir.packInst(inst);
+        ir.insts[result] = inst;
         ir.inst_count += 1;
         return @fromBackingInt(result);
     }
 };
 
-pub const Constant = struct {
-    pub const Tag = enum(u8) {
-        type_lit,
-        fn_type,
-        fn_lit,
-    };
+pub const Type = struct {
+    pub const Id = enum(u32) { none = 0, _ };
 
-    pub const SideEntry = union(enum) {
-        empty,
-        fn_lit: union(enum) {
-            unchecked,
-            queued,
-            checked: TypedIr.InstId,
-        },
+    pub const Tag = enum(u32) {
+        lit,
+        func,
     };
 
     tag: Tag,
     data: union {
-        type_lit: TypeLit,
-        fn_type: struct { ret: Id, args: []Id },
-        fn_lit: struct { file: File.Id, inst: UntypedIr.InstId },
+        lit: TypeLit,
+        func: struct { ret: Id, args: List },
     },
 
-    fn hash(c: Constant) u64 {
-        var fnv = math.Fnv{};
-        fnv.roll(&.{@backingInt(c.tag)});
-        switch (c.tag) {
-            .type_lit => fnv.roll32(@backingInt(c.data.type_lit)),
-            .fn_type => {
-                fnv.roll32(@backingInt(c.data.fn_type.ret));
-                for (c.data.fn_type.args) |arg| {
-                    fnv.roll32(@backingInt(arg));
-                }
-            },
-            .fn_lit => {
-                fnv.roll32(@backingInt(c.data.fn_lit.file));
-                fnv.roll32(@backingInt(c.data.fn_lit.inst));
-            },
-        }
-        return fnv.hash;
-    }
-
-    fn eql(c1: Constant, c2: Constant) bool {
-        if (c1.tag != c2.tag) return false;
-        return switch (c1.tag) {
-            .type_lit => c1.data.type_lit == c2.data.type_lit,
-            .fn_type => blk: {
-                if (c1.data.fn_type.ret != c2.data.fn_type.ret or
-                    c1.data.fn_type.args.len != c2.data.fn_type.args.len)
-                {
-                    break :blk false;
-                }
-
-                for (0..c1.data.fn_type.args.len) |arg_i| {
-                    if (c1.data.fn_type.args[arg_i] != c2.data.fn_type.args[arg_i]) {
-                        break :blk false;
-                    }
-                }
-
-                break :blk true;
-            },
-            .fn_lit => c1.data.fn_lit.file == c2.data.fn_lit.file and
-                c1.data.fn_lit.inst == c2.data.fn_lit.inst,
-        };
-    }
-
-    pub const Id = enum(u32) { none = 0, _ };
+    // TODO: this is not good for lookup, even duplicate lookup need to allocate lists
+    pub const List = struct {
+        offset: u32,
+        count: u32,
+    };
 
     pub const Pool = struct {
-        const max_constants = 4096;
+        const max_types = 4096;
         const max_extras = 2048;
         const max_buckets = 1024;
 
         buckets: [max_buckets]Id = @splat(.none),
-        next: [max_constants]Id = @splat(.none),
+        next: [max_types]Id = @splat(.none),
 
-        side_table: [max_constants]SideEntry = undefined,
-        constants: [max_constants]Packed = undefined,
+        types: [max_types]Type = undefined,
         next_id: u32 = 1,
 
-        extras: [max_extras]u32 = undefined,
+        extras: [max_extras]Id = undefined,
         extra_count: u32 = 0,
 
-        pub fn getOrAddId(pool: *Pool, val: Constant) Id {
-            var slot = &pool.buckets[val.hash() % max_buckets];
+        fn hash(pool: *Pool, t: Type) u64 {
+            var fnv = math.Fnv{};
+            fnv.roll32(@backingInt(t.tag));
+            switch (t.tag) {
+                .lit => fnv.roll32(@backingInt(t.data.lit)),
+                .func => {
+                    fnv.roll32(@backingInt(t.data.func.ret));
+                    for (0..t.data.func.args.count) |i| {
+                        fnv.roll32(@backingInt(pool.extras[t.data.func.args.offset + i]));
+                    }
+                },
+            }
+            return fnv.hash;
+        }
+
+        fn eql(pool: *Pool, t1: Type, t2: Type) bool {
+            if (t1.tag != t2.tag) return false;
+            return switch (t1.tag) {
+                .lit => t1.data.lit == t2.data.lit,
+                .func => blk: {
+                    if (t1.data.func.ret != t2.data.func.ret or
+                        t1.data.func.args.count != t2.data.func.args.count)
+                    {
+                        break :blk false;
+                    }
+
+                    for (0..t1.data.func.args.count) |arg_i| {
+                        const a1 = pool.extras[t1.data.func.args.offset + arg_i];
+                        const a2 = pool.extras[t2.data.func.args.offset + arg_i];
+                        if (a1 != a2) {
+                            break :blk false;
+                        }
+                    }
+
+                    break :blk true;
+                },
+            };
+        }
+
+        pub fn getOrCreateId(pool: *Pool, t: Type) Id {
+            var slot = &pool.buckets[pool.hash(t) % max_buckets];
             while (slot.* != .none) : (slot = &pool.next[@backingInt(slot.*)]) {
-                const val1 = pool.unpack(pool.constants[@backingInt(slot.*)]);
-                if (val1.eql(val)) break;
+                if (pool.eql(pool.types[@backingInt(slot.*)], t)) break;
             }
 
             if (slot.* == .none) {
                 slot.* = @fromBackingInt(pool.next_id);
                 pool.next_id += 1;
-                pool.constants[@backingInt(slot.*)] = pool.pack(val);
-                pool.side_table[@backingInt(slot.*)] = .empty;
+                pool.types[@backingInt(slot.*)] = t;
             }
             return slot.*;
         }
 
-        pub fn get(pool: *Pool, id: Id) Constant {
-            debug.assert(id != .none, "constant pool get none id");
-            return pool.unpack(pool.constants[@backingInt(id)]);
-        }
-
-        pub fn getSideEntry(pool: *Pool, id: Id) *SideEntry {
-            debug.assert(id != .none, "constant pool get none id");
-            return &pool.side_table[@backingInt(id)];
-        }
-
-        const Packed = struct {
-            tag: Tag,
-            v: u32,
-        };
-
-        fn pack(pool: *Pool, val: Constant) Packed {
-            return switch (val.tag) {
-                .type_lit => .{ .tag = val.tag, .v = @backingInt(val.data.type_lit) },
-                .fn_type => blk: {
-                    const extra_offset = pool.extra_count;
-                    pool.extras[pool.extra_count] = @backingInt(val.data.fn_type.ret);
-                    pool.extra_count += 1;
-
-                    pool.extras[pool.extra_count] = @intCast(val.data.fn_type.args.len);
-                    pool.extra_count += 1;
-
-                    for (val.data.fn_type.args) |arg| {
-                        pool.extras[pool.extra_count] = @backingInt(arg);
-                        pool.extra_count += 1;
-                    }
-
-                    break :blk .{ .tag = val.tag, .v = extra_offset };
-                },
-                .fn_lit => blk: {
-                    const extra_offset = pool.extra_count;
-                    pool.extras[pool.extra_count] = @backingInt(val.data.fn_lit.file);
-                    pool.extra_count += 1;
-                    pool.extras[pool.extra_count] = @backingInt(val.data.fn_lit.inst);
-                    pool.extra_count += 1;
-                    break :blk .{ .tag = val.tag, .v = extra_offset };
-                },
+        pub fn allocList(pool: *Pool, ids: []Id) List {
+            const offset = pool.extra_count;
+            for (ids) |id| {
+                pool.extras[pool.extra_count] = id;
+                pool.extra_count += 1;
+            }
+            return .{
+                .offset = offset,
+                .count = @intCast(ids.len),
             };
         }
+    };
+};
 
-        fn unpack(pool: *Pool, p: Packed) Constant {
-            return switch (p.tag) {
-                .type_lit => .{
-                    .tag = p.tag,
-                    .data = .{ .type_lit = @fromBackingInt(p.v) },
-                },
-                .fn_type => blk: {
-                    const ret: Id = @fromBackingInt(pool.extras[p.v]);
-                    const count = pool.extras[p.v + 1];
-                    const ptr: [*]Id = @ptrCast(&pool.extras[p.v + 2]);
-                    break :blk .{
-                        .tag = p.tag,
-                        .data = .{ .fn_type = .{
-                            .ret = ret,
-                            .args = ptr[0..count],
-                        } },
-                    };
-                },
-                .fn_lit => .{
-                    .tag = p.tag,
-                    .data = .{ .fn_lit = .{
-                        .file = @fromBackingInt(pool.extras[p.v]),
-                        .inst = @fromBackingInt(pool.extras[p.v + 1]),
-                    } },
-                },
-            };
+pub const Func = struct {
+    pub const Id = enum(u32) { none = 0, _ };
+
+    status: enum { unchecked, queued, checked },
+
+    type: Type.Id,
+    file: File.Id,
+    untyped_inst: UntypedIr.InstId,
+    typed_inst: TypedIr.InstId,
+
+    pub const Table = struct {
+        const max_funcs = 4096;
+
+        funcs: [max_funcs]Func = undefined,
+        next_id: u32 = 1,
+
+        pub fn add(table: *Table, func: Func) Id {
+            const result = table.next_id;
+            table.next_id += 1;
+            table.funcs[result] = func;
+            return @fromBackingInt(result);
+        }
+
+        pub fn get(table: *Table, id: Id) *Func {
+            debug.assert(id != .none, "get none func");
+            return &table.funcs[@backingInt(id)];
         }
     };
 };

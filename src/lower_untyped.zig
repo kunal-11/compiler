@@ -166,17 +166,20 @@ const State = struct {
             .any => .{
                 .pos = pos,
                 .tag = .block,
-                .data = .{ .block = insts },
+                .data = .{ .block = state.ir.allocList(insts) },
             },
             .compile => .{
                 .pos = pos,
                 .tag = .comp_block,
-                .data = .{ .block = insts },
+                .data = .{ .block = state.ir.allocList(insts) },
             },
             .function => .{
                 .pos = pos,
                 .tag = .fn_lit,
-                .data = .{ .fn_lit = .{ .type = phase.function, .body = insts } },
+                .data = .{ .fn_lit = .{
+                    .type = phase.function,
+                    .body = state.ir.allocList(insts),
+                } },
             },
         };
 
@@ -335,7 +338,8 @@ pub fn lowerFile(ctx: *Context, arena: *mem.Arena, file_id: File.Id, root_id: As
     const node = state.ast.getNode(root_id);
     debug.assert(node.tag == .file, "ast root for lower is not a file");
 
-    for (node.data.block) |global| {
+    for (0..node.data.block.count) |global_i| {
+        const global = state.ast.extras[node.data.block.offset + global_i];
         const decl_node = state.ast.getNode(global);
         const param_node = state.ast.getNode(decl_node.data.decl.param);
 
@@ -432,7 +436,8 @@ fn lower(state: *State, node_id: Ast.NodeId) Ir.InstId {
     return switch (node.tag) {
         .block => blk: {
             state.beginBlock();
-            for (node.data.block) |child| {
+            for (0..node.data.block.count) |child_idx| {
+                const child = state.ast.extras[node.data.block.offset + child_idx];
                 _ = lower(state, child);
             }
             break :blk state.emitBlock(node.pos, .none);
@@ -467,7 +472,8 @@ fn lower(state: *State, node_id: Ast.NodeId) Ir.InstId {
                 state.beginFnBlock(type_inst);
                 const type_node = state.ast.getNode(node.data.fn_lit.fn_type);
                 const args = state.ast.getNode(type_node.data.fn_type.args).data.block;
-                for (args, 0..) |arg, i| {
+                for (0..args.count) |i| {
+                    const arg = state.ast.extras[args.offset + i];
                     const arg_node = state.ast.getNode(arg);
                     const inst = state.emit(.{
                         .pos = arg_node.pos,
@@ -501,7 +507,8 @@ fn lower(state: *State, node_id: Ast.NodeId) Ir.InstId {
                     }
                 }
                 const body_nodes = state.ast.getNode(node.data.fn_lit.block).data.block;
-                for (body_nodes) |body_node| {
+                for (0..body_nodes.count) |body_node_idx| {
+                    const body_node = state.ast.extras[body_nodes.offset + body_node_idx];
                     _ = lower(state, body_node);
                 }
                 break :blk1 state.emitBlock(node.pos, .none);
@@ -517,7 +524,8 @@ fn lower(state: *State, node_id: Ast.NodeId) Ir.InstId {
             const params_node = state.ast.getNode(node.data.fn_type.args);
             const arg_buf = state.arena.pushArray(Ir.InstId, max_fn_args);
             var arg_count: u32 = 0;
-            for (params_node.data.block) |arg| {
+            for (0..params_node.data.block.count) |arg_i| {
+                const arg = state.ast.extras[params_node.data.block.offset + arg_i];
                 const arg_node = state.ast.getNode(arg);
                 arg_buf[arg_count] = lower(state, arg_node.data.param.type);
                 arg_count += 1;
@@ -529,7 +537,7 @@ fn lower(state: *State, node_id: Ast.NodeId) Ir.InstId {
                 .tag = .fn_type,
                 .data = .{ .fn_type = .{
                     .return_type = return_type,
-                    .arg_types = arg_buf[0..arg_count],
+                    .arg_types = state.ir.allocList(arg_buf[0..arg_count]),
                 } },
             });
             break :blk state.emitBlock(node.pos, res);

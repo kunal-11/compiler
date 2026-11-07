@@ -33,7 +33,8 @@ pub fn debugPrintIr(
     switch (inst.tag) {
         .block, .comp_block => {
             debug.print("%{} = {s} {{\n", .{ @backingInt(inst_id), @tagName(inst.tag) });
-            for (inst.data.block) |child_inst| {
+            for (0..inst.data.block.count) |child_inst_i| {
+                const child_inst = ir.extras[inst.data.block.offset + child_inst_i];
                 debugPrintIr(file, ir, child_inst, indent + 1);
             }
             for (0..indent) |_| {
@@ -45,7 +46,8 @@ pub fn debugPrintIr(
             debug.print("%{} = fn_type ( ", .{
                 @backingInt(inst_id),
             });
-            for (inst.data.fn_type.arg_types) |arg| {
+            for (0..inst.data.fn_type.arg_types.count) |arg_i| {
+                const arg = ir.extras[inst.data.fn_type.arg_types.offset + arg_i];
                 debug.print("%{} ", .{@backingInt(arg)});
             }
             debug.print(") %{}\n", .{@backingInt(inst.data.fn_type.return_type)});
@@ -55,7 +57,8 @@ pub fn debugPrintIr(
                 @backingInt(inst_id),
                 @backingInt(inst.data.fn_lit.type),
             });
-            for (inst.data.fn_lit.body) |child_inst| {
+            for (0..inst.data.fn_lit.body.count) |child_inst_i| {
+                const child_inst = ir.extras[inst.data.fn_lit.body.offset + child_inst_i];
                 debugPrintIr(file, ir, child_inst, indent + 1);
             }
             for (0..indent) |_| {
@@ -131,8 +134,9 @@ pub fn debugPrintAst(
     switch (node.tag) {
         .file, .block, .params => {
             const block = node.data.block;
-            for (block, 0..) |id, idx| {
-                debugPrintAst(file, ast, id, child_len, idx == block.len - 1);
+            for (0..block.count) |idx| {
+                const id = ast.extras[block.offset + idx];
+                debugPrintAst(file, ast, id, child_len, idx == block.count - 1);
             }
         },
 
