@@ -154,7 +154,7 @@ const State = struct {
                 _ = state.emit(.{
                     .pos = pos,
                     .tag = .ret_implicit,
-                    .data = .{ .unary_op = block.reserved_id },
+                    .data = .{ .unary_op = .none },
                 });
             },
         }
@@ -598,7 +598,6 @@ fn lower(state: *State, node_id: Ast.NodeId) Ir.InstId {
                 .tag = .alloc,
                 .data = .{ .unary_op = type_inst },
             });
-
             _ = state.emit(.{
                 .pos = node.pos,
                 .tag = .store,

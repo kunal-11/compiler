@@ -5,6 +5,9 @@ const Ast = @import("types.zig").Ast;
 const Context = @import("types.zig").Context;
 const File = @import("types.zig").File;
 const UntypedIr = @import("types.zig").UntypedIr;
+const TypedIr = @import("types.zig").TypedIr;
+const Type = @import("types.zig").Type;
+const Constant = @import("types.zig").Constant;
 const InternPool = @import("types.zig").InternPool;
 
 const lexer = @import("lexer.zig");
@@ -15,6 +18,91 @@ pub fn debugPrintMessages(ctx: *Context) void {
     for (ctx.msgs[0..ctx.msg_count], 0..) |msg, id| {
         debug.print("{} {}\n", .{ id + 1, msg });
     }
+}
+
+pub fn debugPrintType(pool: *Type.Pool, id: Type.Id) void {
+    if (id == .none) {
+        debug.print("none", .{});
+        return;
+    }
+    const t = pool.getType(id);
+    switch (t.tag) {
+        .lit => debug.print("{s}", .{@tagName(t.data.lit)}),
+        .ptr => {
+            debug.print("*", .{});
+            debugPrintType(pool, t.data.ptr);
+        },
+        .func => {
+            debug.print("fn (", .{});
+            for (0..t.data.func.args.count) |i| {
+                const arg_id = pool.extras[t.data.func.args.offset + i];
+                debugPrintType(pool, arg_id);
+            }
+            debug.print(") ", .{});
+            debugPrintType(pool, t.data.func.ret);
+        },
+    }
+}
+
+pub fn debugPrintConstant(pool: *Constant.Pool, id: Constant.Id) void {
+    const c = pool.get(id);
+    switch (c) {
+        .undef => debug.print("#undefined", .{}),
+        .bool => |v| debug.print("#{}", .{v}),
+        .int => |v| debug.print("#{}", .{v}),
+        .float => |v| debug.print("#{}", .{v}),
+        .global => |v| debug.print("#global:{}", .{@backingInt(v)}),
+    }
+}
+
+pub fn debugPrintTypedIr(
+    ctx: *Context,
+    ir: *TypedIr,
+    inst_id: TypedIr.InstId,
+    indent: u32,
+) void {
+    const inst = ir.getInst(inst_id);
+
+    for (0..indent) |_| {
+        debug.print("{s}", .{ir_indent});
+    }
+    debug.print("%{}: ", .{@backingInt(inst_id)});
+    debugPrintType(&ctx.type_pool, inst.type);
+    debug.print(" = ", .{});
+
+    switch (inst.tag) {
+        .constant => debugPrintConstant(&ctx.constant_pool, inst.data.constant),
+        .add, .subtract, .mul, .div, .mod, .store => {
+            debug.print("{s} %{} %{}", .{
+                @tagName(inst.tag),
+                @backingInt(inst.data.bin_op.lhs),
+                @backingInt(inst.data.bin_op.rhs),
+            });
+        },
+
+        .alloc => {
+            debug.print("{s} ", .{@tagName(inst.tag)});
+            debugPrintType(&ctx.type_pool, inst.data.alloc);
+        },
+
+        .load, .ret => {
+            debug.print("{s} %{}", .{ @tagName(inst.tag), @backingInt(inst.data.unary_op) });
+        },
+
+        .func => {
+            debug.print("{{\n", .{});
+            for (0..inst.data.block.count) |child_inst_i| {
+                const child_inst = ir.extras[inst.data.block.offset + child_inst_i];
+                debugPrintTypedIr(ctx, ir, child_inst, indent + 1);
+            }
+            for (0..indent) |_| {
+                debug.print("{s}", .{ir_indent});
+            }
+            debug.print("}}", .{});
+        },
+    }
+
+    debug.print("\n", .{});
 }
 
 const ir_indent = "    ";

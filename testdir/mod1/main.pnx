@@ -4,14 +4,13 @@ global_var := 20;
 
 main :: fn () void {
 	z := undefined;
-	b := true;
-	x := global + 10;
-	x = x + 12;
+	b := 10;
+	z = b + 12;
 };
 
 func :: fn (arg0: u32, arg1: i32, arg2: f32) bool {
 	const :: 5;
-	x := arg0 + const + 1 + arg1;
+	x := global + arg0 + const + 1 + arg1;
 
 	global_var = x + 10;
 

@@ -420,19 +420,24 @@ pub const UntypedIr = struct {
 
 pub const TypedIr = struct {
     pub const Tag = enum(u32) {
-        arg,
         constant,
 
         add,
+        subtract,
+        mul,
+        div,
+        mod,
 
         alloc,
         load,
         store,
 
+        ret,
+
         func,
     };
 
-    pub const InstId = enum(u32) { none = 0, _ };
+    pub const InstId = enum(u32) { none = 0, poison = 1, _ };
 
     pub const Inst = struct {
         pos: u32,
@@ -452,7 +457,7 @@ pub const TypedIr = struct {
     const max_extras = 4096;
 
     insts: [max_insts]Inst = undefined,
-    inst_count: u32 = 1,
+    inst_count: u32 = 2,
 
     extras: [max_extras]InstId = undefined,
     extra_count: u32 = 0,
@@ -760,6 +765,11 @@ pub const Constant = union(enum) {
 
         pub fn global(pool: *Pool, v: Symbol.Id) Id {
             return pool.getOrCreateId(.{ .global = v });
+        }
+
+        pub fn get(pool: *Pool, id: Id) Constant {
+            debug.assert(id != .none, "get none constant");
+            return pool.constants[@backingInt(id)];
         }
     };
 };

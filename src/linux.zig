@@ -34,6 +34,18 @@ pub fn main() !void {
     _ = try loadFile(ctx, &arena, global_ns_id, test_file);
 
     analyzer.analyze(ctx, &arena);
+
+    for (ctx.func_table.funcs[1..ctx.func_table.next_id]) |f| {
+        const file = ctx.getFile(f.file);
+        switch (f.status) {
+            .unchecked => {},
+            .queued => @panic("queued func left after analysis"),
+            .checked => |inst| {
+                printer.debugPrintTypedIr(ctx, file.typed_ir, inst, 0);
+            },
+        }
+    }
+
     printer.debugPrintMessages(ctx);
 }
 

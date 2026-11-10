@@ -81,7 +81,8 @@ pub fn analyze(ctx: *Context, arena: *mem.Arena) void {
 
                 const lower = Lower.init(ctx, func.file, func.status.queued, arena);
                 lower.lowerInst(func.untyped_inst, func.type);
-                func.status = .{ .checked = lower.results[@backingInt(func.untyped_inst)].inst };
+                const fn_inst = lower.results[@backingInt(func.untyped_inst)].inst;
+                func.status = .{ .checked = fn_inst };
             },
             .empty => unreachable,
         }
@@ -135,6 +136,8 @@ const Lower = struct {
     }
 
     fn ref(lower: *Lower, inst_id: UntypedIr.InstId) TypedIr.InstId {
+        if (inst_id == .none) return .none;
+        if (inst_id == .poison) return .poison;
         return switch (lower.results[@backingInt(inst_id)]) {
             .constant => blk: {
                 const value = lower.eval.results[@backingInt(inst_id)];
@@ -161,22 +164,7 @@ const Lower = struct {
     fn lowerInst(lower: *Lower, inst_id: UntypedIr.InstId, res_type: Type.Id) void {
         const file = lower.ctx.getFile(lower.file_id);
         const inst = file.untyped_ir.getInst(inst_id);
-        lower.results[@backingInt(inst_id)] = switch (inst.tag) {
-            .store => blk: {
-                const addr = lower.ref(inst.data.bin_op.lhs);
-                const rhs = lower.ref(inst.data.bin_op.rhs);
-
-                // TODO: check lhs is pointer to type compatible with rhs
-
-                const typed_inst = lower.emit(.{
-                    .type = lower.ctx.type_pool.literal(.void),
-                    .pos = inst.pos,
-                    .tag = .store,
-                    .data = .{ .bin_op = .{ .lhs = addr, .rhs = rhs } },
-                });
-                break :blk .{ .inst = typed_inst };
-            },
-
+        const res: Value = switch (inst.tag) {
             .fn_lit => blk: {
                 const marker = lower.inst_count;
                 for (0..inst.data.fn_lit.body.count) |inst_idx| {
@@ -191,6 +179,21 @@ const Lower = struct {
                     .type = lower.eval.results[@backingInt(inst_id)].type,
                     .tag = .func,
                     .data = .{ .block = lower.typed_ir.allocList(block) },
+                });
+                break :blk .{ .inst = typed_inst };
+            },
+
+            .store => blk: {
+                const addr = lower.ref(inst.data.bin_op.lhs);
+                const rhs = lower.ref(inst.data.bin_op.rhs);
+
+                // TODO: coerce lhs to rhs pointer
+
+                const typed_inst = lower.emit(.{
+                    .type = lower.ctx.type_pool.literal(.void),
+                    .pos = inst.pos,
+                    .tag = .store,
+                    .data = .{ .bin_op = .{ .lhs = addr, .rhs = rhs } },
                 });
                 break :blk .{ .inst = typed_inst };
             },
@@ -218,11 +221,55 @@ const Lower = struct {
                 break :blk .{ .inst = typed_inst };
             },
 
-            .add => @panic("TODO: arithmatic"),
+            .add, .subtract, .mul, .div, .mod => blk: {
+                const lhs = lower.results[@backingInt(inst.data.bin_op.lhs)];
+                const rhs = lower.results[@backingInt(inst.data.bin_op.rhs)];
+                if (lhs == .constant and rhs == .constant) {
+                    const res = lower.eval.evalInst(inst_id, res_type);
+                    lower.eval.results[@backingInt(inst_id)] = res.value;
+                    break :blk .constant;
+                } else {
+                    const lhs_ref = lower.ref(inst.data.bin_op.lhs);
+                    const rhs_ref = lower.ref(inst.data.bin_op.rhs);
+
+                    const lhs_type = lower.typed_ir.getInst(lhs_ref).type;
+                    const rhs_type = lower.typed_ir.getInst(rhs_ref).type;
+                    const type_id = peerType(lower.ctx, lhs_type, rhs_type);
+                    // if (type_id == .none) {
+                    //     @panic("TODO: handle type check error");
+                    // }
+
+                    const typed_inst = lower.emit(.{
+                        .pos = inst.pos,
+                        .type = type_id,
+                        .tag = switch (inst.tag) {
+                            .add => .add,
+                            .subtract => .subtract,
+                            .mul => .mul,
+                            .div => .div,
+                            .mod => .mod,
+                            else => unreachable,
+                        },
+                        .data = .{ .bin_op = .{ .lhs = lhs_ref, .rhs = rhs_ref } },
+                    });
+                    break :blk .{ .inst = typed_inst };
+                }
+            },
 
             .global_ptr, .global_val => @panic("TODO: global name resolve"),
 
-            .ret, .ret_implicit => @panic("TODO: ret"),
+            .ret, .ret_implicit => blk: {
+                // TODO: remove ret_implicit based on coverage
+
+                const val = lower.ref(inst.data.unary_op);
+                const typed_inst = lower.emit(.{
+                    .pos = inst.pos,
+                    .tag = .ret,
+                    .type = lower.ctx.type_pool.literal(.noreturn),
+                    .data = .{ .unary_op = val },
+                });
+                break :blk .{ .inst = typed_inst };
+            },
 
             .undef_lit, .type_lit, .num_lit, .bool_lit, .comp_block, .type_of, .fn_type => blk: {
                 const res = lower.eval.evalInst(inst_id, res_type);
@@ -232,6 +279,17 @@ const Lower = struct {
 
             else => @panic("TODO"),
         };
+        lower.results[@backingInt(inst_id)] = res;
+
+        const value_type = switch (res) {
+            .none => unreachable,
+            .constant => lower.eval.results[@backingInt(inst_id)].type,
+            .inst => |i| lower.typed_ir.getInst(i).type,
+        };
+
+        if (!coerce(lower.ctx, value_type, res_type)) {
+            @panic("TODO: handle type check error");
+        }
     }
 };
 
@@ -248,7 +306,7 @@ pub const Eval = struct {
         },
     };
 
-    arena: mem.Arena,
+    arena: *mem.Arena,
     results: []Value,
 
     ctx: *Context,
@@ -262,7 +320,7 @@ pub const Eval = struct {
         const namespace = ctx.getNamespace(file.namespace_id);
         const eval = arena.pushStruct(Eval);
         eval.* = .{
-            .arena = arena.subArena(8 * mem.KB),
+            .arena = arena,
             .ctx = ctx,
             .file_id = file_id,
             .results = arena.pushArray(Value, file.untyped_ir.inst_count),
@@ -336,9 +394,6 @@ pub const Eval = struct {
             },
 
             .fn_type => blk: {
-                const flusher = mem.Flusher.init(&eval.arena);
-                defer flusher.flush();
-
                 const ret = results[@backingInt(inst.data.fn_type.return_type)].val.type;
                 const args = eval.arena.pushArray(Type.Id, inst.data.fn_type.arg_types.count);
                 for (0..inst.data.fn_type.arg_types.count) |i| {
@@ -386,4 +441,10 @@ fn coerce(ctx: *Context, from_id: Type.Id, to_id: Type.Id) bool {
         // TODO: allow comp int to coerce if value is in bounds
     }
     return false;
+}
+
+fn peerType(ctx: *Context, t1: Type.Id, t2: Type.Id) Type.Id {
+    _ = ctx;
+    if (t1 == t2) return t1;
+    return .none;
 }
