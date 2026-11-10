@@ -5,7 +5,6 @@ const debug = stdx.debug;
 
 const lexer = @import("lexer.zig");
 const analyzer = @import("analyzer.zig");
-const Eval = @import("Eval.zig");
 
 pub const Message = struct {
     pub const Severity = enum { info, warn, err };
@@ -773,7 +772,7 @@ pub const Func = struct {
     untyped_inst: UntypedIr.InstId,
     status: union(enum) {
         unchecked,
-        queued: *Eval,
+        queued: *analyzer.Eval,
         checked: TypedIr.InstId,
     },
 

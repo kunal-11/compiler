@@ -15,7 +15,6 @@ const Namespace = @import("types.zig").Namespace;
 const Constant = @import("types.zig").Constant;
 
 const lexer = @import("lexer.zig");
-const Eval = @import("Eval.zig");
 
 pub const Queue = struct {
     pub const Item = union(enum) {
@@ -52,13 +51,14 @@ pub fn analyze(ctx: *Context, arena: *mem.Arena) void {
         switch (item) {
             .decl => |decl| {
                 const symbol = ctx.symbol_table.get(decl);
-                if (symbol.type_inst != .none) {
-                    @panic("TODO: handle type annotations of global decls");
-                }
+                const eval = Eval.init(ctx, arena, symbol.file);
                 const file = ctx.getFile(symbol.file);
 
-                const eval = Eval.init(ctx, arena, symbol.file);
-                const result = eval.evalInst(symbol.value_inst).value;
+                const res_type = if (symbol.type_inst != .none)
+                    eval.evalInst(symbol.type_inst, ctx.type_pool.literal(.type_id)).value.val.type
+                else
+                    .none;
+                const result = eval.evalInst(symbol.value_inst, res_type).value;
 
                 switch (result.val) {
                     .fn_lit => {
@@ -80,7 +80,7 @@ pub fn analyze(ctx: *Context, arena: *mem.Arena) void {
                 debug.assert(func.status == .queued, "fn check item invalid status");
 
                 const lower = Lower.init(ctx, func.file, func.status.queued, arena);
-                lower.lowerInst(func.untyped_inst);
+                lower.lowerInst(func.untyped_inst, func.type);
                 func.status = .{ .checked = lower.results[@backingInt(func.untyped_inst)].inst };
             },
             .empty => unreachable,
@@ -158,7 +158,7 @@ const Lower = struct {
         };
     }
 
-    fn lowerInst(lower: *Lower, inst_id: UntypedIr.InstId) void {
+    fn lowerInst(lower: *Lower, inst_id: UntypedIr.InstId, res_type: Type.Id) void {
         const file = lower.ctx.getFile(lower.file_id);
         const inst = file.untyped_ir.getInst(inst_id);
         lower.results[@backingInt(inst_id)] = switch (inst.tag) {
@@ -181,7 +181,7 @@ const Lower = struct {
                 const marker = lower.inst_count;
                 for (0..inst.data.fn_lit.body.count) |inst_idx| {
                     const id = lower.untyped_ir.extras[inst.data.fn_lit.body.offset + inst_idx];
-                    lowerInst(lower, id);
+                    lower.lowerInst(id, .none);
                 }
                 const block = lower.insts[marker..lower.inst_count];
                 lower.inst_count = marker;
@@ -210,7 +210,7 @@ const Lower = struct {
             .alloc => blk: {
                 const type_id = lower.eval.results[@backingInt(inst.data.unary_op)].val.type;
                 const typed_inst = lower.emit(.{
-                    .type = type_id,
+                    .type = lower.ctx.type_pool.ptr(type_id),
                     .pos = inst.pos,
                     .tag = .alloc,
                     .data = .{ .alloc = type_id },
@@ -225,7 +225,7 @@ const Lower = struct {
             .ret, .ret_implicit => @panic("TODO: ret"),
 
             .undef_lit, .type_lit, .num_lit, .bool_lit, .comp_block, .type_of, .fn_type => blk: {
-                const res = lower.eval.evalInst(inst_id);
+                const res = lower.eval.evalInst(inst_id, res_type);
                 lower.eval.results[@backingInt(inst_id)] = res.value;
                 break :blk .constant;
             },
@@ -234,3 +234,156 @@ const Lower = struct {
         };
     }
 };
+
+pub const Eval = struct {
+    pub const Value = struct {
+        type: Type.Id,
+        val: union(enum) {
+            void,
+            undef,
+            type: Type.Id,
+            number: i64,
+            boolean: bool,
+            fn_lit: Func.Id,
+        },
+    };
+
+    arena: mem.Arena,
+    results: []Value,
+
+    ctx: *Context,
+    file_id: File.Id,
+
+    untyped_ir: *UntypedIr,
+    namespace: *Namespace,
+
+    pub fn init(ctx: *Context, arena: *mem.Arena, file_id: File.Id) *Eval {
+        const file = ctx.getFile(file_id);
+        const namespace = ctx.getNamespace(file.namespace_id);
+        const eval = arena.pushStruct(Eval);
+        eval.* = .{
+            .arena = arena.subArena(8 * mem.KB),
+            .ctx = ctx,
+            .file_id = file_id,
+            .results = arena.pushArray(Value, file.untyped_ir.inst_count),
+            .untyped_ir = file.untyped_ir,
+            .namespace = namespace,
+        };
+        for (eval.results) |*r| r.* = .{ .type = .none, .val = .void };
+        return eval;
+    }
+
+    pub const Result = struct {
+        value: Value,
+        control: union(enum) { none, brk: UntypedIr.InstId } = .none,
+    };
+
+    pub fn evalInst(eval: *Eval, inst_id: UntypedIr.InstId, res_type: Type.Id) Result {
+        const file = eval.ctx.getFile(eval.file_id);
+        const inst = file.untyped_ir.getInst(inst_id);
+        const results = eval.results;
+        const res: Result = switch (inst.tag) {
+            .type_lit => .{ .value = .{
+                .type = eval.ctx.type_pool.literal(.type_id),
+                .val = .{ .type = eval.ctx.type_pool.literal(inst.data.type_lit) },
+            } },
+            .undef_lit => .{ .value = .{
+                .type = eval.ctx.type_pool.literal(.comp_undef),
+                .val = .undef,
+            } },
+            .num_lit => blk: {
+                const num_token = lexer.lexToken(file.contents, inst.pos);
+                debug.assert(num_token.tag == .num_literal, "num lit lexed token invalid");
+                const num_str = file.contents[num_token.start..num_token.end];
+                const num = math.parseInt(i64, num_str) catch @panic("TODO: handle invalid num");
+                break :blk .{ .value = .{
+                    .type = eval.ctx.type_pool.literal(.comp_int),
+                    .val = .{ .number = num },
+                } };
+            },
+            .bool_lit => .{ .value = .{
+                .type = eval.ctx.type_pool.literal(.bool),
+                .val = .{ .boolean = inst.data.bool_lit },
+            } },
+
+            .block, .comp_block => blk: {
+                for (0..inst.data.block.count) |inst_idx| {
+                    const child_id = file.untyped_ir.extras[inst.data.block.offset + inst_idx];
+                    const res = eval.evalInst(child_id, .none);
+                    switch (res.control) {
+                        .none => eval.results[@backingInt(child_id)] = res.value,
+                        .brk => |block| {
+                            break :blk if (block == inst_id) .{ .value = res.value } else res;
+                        },
+                    }
+                }
+                @panic("block did not end with break");
+            },
+
+            .type_of => .{ .value = .{
+                .type = eval.ctx.type_pool.literal(.type_id),
+                .val = .{ .type = results[@backingInt(inst.data.unary_op)].type },
+            } },
+
+            .brk => .{
+                .value = eval.results[@backingInt(inst.data.bin_op.rhs)],
+                .control = .{ .brk = inst.data.bin_op.lhs },
+            },
+
+            .brk_implicit => .{
+                .value = .{ .type = eval.ctx.type_pool.literal(.void), .val = .void },
+                .control = .{ .brk = inst.data.unary_op },
+            },
+
+            .fn_type => blk: {
+                const flusher = mem.Flusher.init(&eval.arena);
+                defer flusher.flush();
+
+                const ret = results[@backingInt(inst.data.fn_type.return_type)].val.type;
+                const args = eval.arena.pushArray(Type.Id, inst.data.fn_type.arg_types.count);
+                for (0..inst.data.fn_type.arg_types.count) |i| {
+                    const arg = file.untyped_ir.extras[inst.data.fn_type.arg_types.offset + i];
+                    args[i] = results[@backingInt(arg)].val.type;
+                }
+
+                break :blk .{ .value = .{
+                    .type = eval.ctx.type_pool.literal(.type_id),
+                    .val = .{ .type = eval.ctx.type_pool.func(ret, args) },
+                } };
+            },
+            .fn_lit => blk: {
+                const type_res = results[@backingInt(inst.data.fn_lit.type)];
+                const func_id = eval.ctx.func_table.add(.{
+                    .file = eval.file_id,
+                    .type = type_res.val.type,
+                    .untyped_inst = inst_id,
+                    .status = .unchecked,
+                });
+                break :blk .{ .value = .{
+                    .type = type_res.val.type,
+                    .val = .{ .fn_lit = func_id },
+                } };
+            },
+
+            else => @panic("TODO: eval other instructions"),
+        };
+
+        if (!coerce(eval.ctx, res.value.type, res_type)) {
+            @panic("TODO: handle type check error");
+        }
+        return res;
+    }
+};
+
+fn coerce(ctx: *Context, from_id: Type.Id, to_id: Type.Id) bool {
+    if (to_id == .none or from_id == to_id) return true;
+
+    const from = ctx.type_pool.getType(from_id);
+    if (from.tag == .lit) {
+        const from_lit = from.data.lit;
+        if (from_lit == .comp_undef) return true;
+
+        // TODO: allow comp int to coerce if value is in bounds
+    }
+    return false;
+}
