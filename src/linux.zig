@@ -72,6 +72,7 @@ fn loadFile(ctx: *Context, arena: *mem.Arena, ns_id: Namespace.Id, path: []const
         .ast = ast,
         .untyped_ir = untyped_ir,
         .typed_ir = typed_ir,
+        .namespace_id = ns_id,
     });
 
     const root_node = parser.parseFile(ctx, arena, file_id);
@@ -98,7 +99,6 @@ fn loadFile(ctx: *Context, arena: *mem.Arena, ns_id: Namespace.Id, path: []const
             .pos = decl.pos,
             .value_inst = decl.value,
             .type_inst = decl.type,
-            .result = undefined,
         });
 
         switch (ns.add(decl.name, symbol_id)) {

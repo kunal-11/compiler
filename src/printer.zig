@@ -84,7 +84,7 @@ pub fn debugPrintIr(
             debug.print("%{} = {s} #{s}\n", .{ @backingInt(inst_id), @tagName(inst.tag), str });
         },
 
-        .add, .subtract, .mul, .div, .mod, .alloc, .store, .brk => {
+        .add, .subtract, .mul, .div, .mod, .store, .brk => {
             debug.print("%{} = {s} %{} %{}\n", .{
                 @backingInt(inst_id),
                 @tagName(inst.tag),
@@ -92,7 +92,7 @@ pub fn debugPrintIr(
                 @backingInt(inst.data.bin_op.rhs),
             });
         },
-        .type_of, .load, .negate, .ret, .brk_implicit, .ret_implicit => {
+        .type_of, .load, .alloc, .negate, .ret, .brk_implicit, .ret_implicit => {
             debug.print("%{} = {s} %{}\n", .{
                 @backingInt(inst_id),
                 @tagName(inst.tag),

@@ -596,7 +596,16 @@ fn lower(state: *State, node_id: Ast.NodeId) Ir.InstId {
             const inst = state.emit(.{
                 .pos = param.pos,
                 .tag = .alloc,
-                .data = .{ .bin_op = .{ .lhs = type_inst, .rhs = value_inst } },
+                .data = .{ .unary_op = type_inst },
+            });
+
+            _ = state.emit(.{
+                .pos = node.pos,
+                .tag = .store,
+                .data = .{ .bin_op = .{
+                    .lhs = inst,
+                    .rhs = value_inst,
+                } },
             });
             const name = Name{
                 .pos = param.pos,
