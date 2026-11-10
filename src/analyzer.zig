@@ -235,9 +235,9 @@ const Lower = struct {
                     const lhs_type = lower.typed_ir.getInst(lhs_ref).type;
                     const rhs_type = lower.typed_ir.getInst(rhs_ref).type;
                     const type_id = peerType(lower.ctx, lhs_type, rhs_type);
-                    // if (type_id == .none) {
-                    //     @panic("TODO: handle type check error");
-                    // }
+                    if (type_id == .none) {
+                        @panic("TODO: handle type check error");
+                    }
 
                     const typed_inst = lower.emit(.{
                         .pos = inst.pos,
