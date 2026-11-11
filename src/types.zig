@@ -6,6 +6,8 @@ const debug = stdx.debug;
 const lexer = @import("lexer.zig");
 const analyzer = @import("analyzer.zig");
 
+const typed_lower = @import("lower_typed.zig");
+
 pub const Message = struct {
     pub const Severity = enum { info, warn, err };
 
@@ -437,7 +439,7 @@ pub const TypedIr = struct {
         func,
     };
 
-    pub const InstId = enum(u32) { none = 0, poison = 1, _ };
+    pub const InstId = enum(u32) { none = 0, _ };
 
     pub const Inst = struct {
         pos: u32,
@@ -457,7 +459,7 @@ pub const TypedIr = struct {
     const max_extras = 4096;
 
     insts: [max_insts]Inst = undefined,
-    inst_count: u32 = 2,
+    inst_count: u32 = 1,
 
     extras: [max_extras]InstId = undefined,
     extra_count: u32 = 0,
@@ -782,7 +784,7 @@ pub const Func = struct {
     untyped_inst: UntypedIr.InstId,
     status: union(enum) {
         unchecked,
-        queued: *analyzer.Eval,
+        queued: *typed_lower.State,
         checked: TypedIr.InstId,
     },
 
