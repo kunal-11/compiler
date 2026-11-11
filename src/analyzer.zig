@@ -92,7 +92,7 @@ pub fn analyze(ctx: *Context, arena: *mem.Arena) void {
                     .{ .explicit = func.type },
                     .emit,
                 );
-                debug.assert(jump == .none, "jump on emit mode lower");
+                debug.assert(jump.control == .none, "jump on emit mode lower");
                 const fn_inst = func.status.queued.results[@backingInt(func.untyped_inst)].runtime;
                 func.status = .{ .checked = fn_inst };
             },

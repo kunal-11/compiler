@@ -77,10 +77,7 @@ pub const State = struct {
         return switch (lower.results[@backingInt(inst_id)]) {
             .none => @panic("type of none value"),
             .known => |val| val.type,
-            .runtime => |child_id| rt_blk: {
-                const child = lower.typed_ir.getInst(child_id);
-                break :rt_blk child.type;
-            },
+            .runtime => |child_id| lower.typed_ir.getInst(child_id).type,
         };
     }
 
@@ -119,175 +116,70 @@ pub fn evalBlock(
     res_type: ResultType,
 ) *State {
     const state = State.init(ctx, file_id, arena);
-    const jump = lowerInst(state, inst_id, res_type, .exec);
-    debug.assert(jump == .none, "global block must break to itself");
+    const res = lowerInst(state, inst_id, res_type, .exec);
+    debug.assert(res.control == .none, "global block must break to itself");
     return state;
 }
 
 const Mode = enum { emit, exec };
-const Jump = union(enum) {
-    none,
-    brk: struct { block: UntypedIr.InstId, value: Known },
-};
 
-pub fn lowerInst(lower: *State, inst_id: UntypedIr.InstId, res_type: ResultType, mode: Mode) Jump {
-    const file = lower.ctx.getFile(lower.file_id);
-    const inst = file.untyped_ir.getInst(inst_id);
-    lower.results[@backingInt(inst_id)] = switch (inst.tag) {
-        .comp_block => switch (mode) {
-            .emit => blk: {
-                const jump = lowerInst(lower, inst_id, res_type, .exec);
-                debug.assert(jump == .none, "comp block cannot break in emit");
-                break :blk lower.results[@backingInt(inst_id)];
-            },
-            .exec => blk: {
-                for (0..inst.data.block.count) |inst_idx| {
-                    const child_id = lower.untyped_ir.extras[inst.data.block.offset + inst_idx];
-                    const jump = lowerInst(lower, child_id, res_type, .exec);
-                    switch (jump) {
-                        .none => {},
-                        .brk => |res| if (res.block == inst_id)
-                            break :blk .{ .known = res.value }
-                        else
-                            return jump,
-                    }
-                }
-                @panic("block did not end with break");
-            },
-        },
+pub fn lowerInst(
+    state: *State,
+    inst_id: UntypedIr.InstId,
+    res_type: ResultType,
+    mode: Mode,
+) Result {
+    const inst = state.untyped_ir.getInst(inst_id);
+    const res: Result = switch (inst.tag) {
+        .comp_block => lowerCompBlock(state, inst_id, res_type, mode),
+        .fn_lit => lowerFnLit(state, inst_id, mode),
 
-        .fn_lit => switch (mode) {
-            .emit => blk: {
-                const marker = lower.inst_count;
-                for (0..inst.data.fn_lit.body.count) |inst_idx| {
-                    const id = lower.untyped_ir.extras[inst.data.fn_lit.body.offset + inst_idx];
-                    const jump = lowerInst(lower, id, .implicit, .emit);
-                    debug.assert(jump == .none, "emit mode should not jump");
-                }
-                const block = lower.insts[marker..lower.inst_count];
-                lower.inst_count = marker;
+        .alloc => lowerAlloc(state, inst_id, mode),
+        .load => lowerLoad(state, inst_id, mode),
+        .store => lowerStore(state, inst_id, mode),
 
-                const typed_inst = lower.emit(.{
-                    .pos = inst.pos,
-                    .type = lower.results[@backingInt(inst_id)].known.type,
-                    .tag = .func,
-                    .data = .{ .block = lower.typed_ir.allocList(block) },
-                });
-                break :blk .{ .runtime = typed_inst };
-            },
-            .exec => blk: {
-                const type_res = lower.results[@backingInt(inst.data.fn_lit.type)];
-                const func_id = lower.ctx.func_table.add(.{
-                    .file = lower.file_id,
-                    .type = type_res.known.val.type,
-                    .untyped_inst = inst_id,
-                    .status = .unchecked,
-                });
-                break :blk .{ .known = .{
-                    .type = type_res.known.val.type,
-                    .val = .{ .fn_lit = func_id },
-                } };
-            },
-        },
+        .fn_type => lowerFnType(state, inst_id),
+        .num_lit => lowerNumLit(state, inst_id),
+
+        .type_lit => .{ .value = .{ .known = .{
+            .type = state.ctx.type_pool.literal(.type_id),
+            .val = .{ .type = state.ctx.type_pool.literal(inst.data.type_lit) },
+        } } },
+
+        .undef_lit => .{ .value = .{ .known = .{
+            .type = state.ctx.type_pool.literal(.comp_undef),
+            .val = .undef,
+        } } },
+
+        .bool_lit => .{ .value = .{ .known = .{
+            .type = state.ctx.type_pool.literal(.bool),
+            .val = .{ .boolean = inst.data.bool_lit },
+        } } },
+
+        .type_of => .{ .value = .{ .known = .{
+            .type = state.ctx.type_pool.literal(.type_id),
+            .val = .{ .type = state.typeOf(inst.data.unary_op) },
+        } } },
 
         .brk => switch (mode) {
             .emit => @panic("TODO"),
-            .exec => return .{ .brk = .{
-                .value = lower.results[@backingInt(inst.data.bin_op.rhs)].known,
-                .block = inst.data.bin_op.lhs,
-            } },
+            .exec => return .{
+                .value = state.results[@backingInt(inst.data.bin_op.rhs)],
+                .control = .{ .brk = inst.data.bin_op.lhs },
+            },
         },
-
         .brk_implicit => switch (mode) {
             .emit => @panic("TODO"),
-            .exec => return .{ .brk = .{
-                .value = .{ .type = lower.ctx.type_pool.literal(.void), .val = .void },
-                .block = inst.data.unary_op,
-            } },
-        },
-
-        .store => switch (mode) {
-            .emit => blk: {
-                const addr = lower.ref(inst.data.bin_op.lhs);
-                const rhs = lower.ref(inst.data.bin_op.rhs);
-
-                // TODO: coerce lhs to rhs pointer
-
-                const typed_inst = lower.emit(.{
-                    .type = lower.ctx.type_pool.literal(.void),
-                    .pos = inst.pos,
-                    .tag = .store,
-                    .data = .{ .bin_op = .{ .lhs = addr, .rhs = rhs } },
-                });
-                break :blk .{ .runtime = typed_inst };
+            .exec => return .{
+                .value = .{ .known = .{
+                    .type = state.ctx.type_pool.literal(.void),
+                    .val = .void,
+                } },
+                .control = .{ .brk = inst.data.unary_op },
             },
-            .exec => @panic("TODO"),
         },
 
-        .load => switch (mode) {
-            .emit => blk: {
-                const addr = lower.ref(inst.data.unary_op);
-                const addr_inst = lower.typed_ir.getInst(addr);
-                const typed_inst = lower.emit(.{
-                    .type = lower.ctx.type_pool.getType(addr_inst.type).data.ptr,
-                    .pos = inst.pos,
-                    .tag = .load,
-                    .data = .{ .unary_op = addr },
-                });
-                break :blk .{ .runtime = typed_inst };
-            },
-            .exec => @panic("TODO"),
-        },
-
-        .alloc => switch (mode) {
-            .emit => blk: {
-                const type_id = lower.results[@backingInt(inst.data.unary_op)].known.val.type;
-                const typed_inst = lower.emit(.{
-                    .type = lower.ctx.type_pool.ptr(type_id),
-                    .pos = inst.pos,
-                    .tag = .alloc,
-                    .data = .{ .alloc = type_id },
-                });
-                break :blk .{ .runtime = typed_inst };
-            },
-            .exec => @panic("TODO"),
-        },
-
-        .add, .subtract, .mul, .div, .mod => switch (mode) {
-            .emit => blk: {
-                const lhs = lower.results[@backingInt(inst.data.bin_op.lhs)];
-                const rhs = lower.results[@backingInt(inst.data.bin_op.rhs)];
-                if (lhs == .known and rhs == .known) {
-                    @panic("TODO");
-                } else {
-                    const lhs_ref = lower.ref(inst.data.bin_op.lhs);
-                    const rhs_ref = lower.ref(inst.data.bin_op.rhs);
-
-                    const lhs_type = lower.typed_ir.getInst(lhs_ref).type;
-                    const rhs_type = lower.typed_ir.getInst(rhs_ref).type;
-                    const type_id = peerType(lower.ctx, lhs_type, rhs_type);
-                    if (type_id == .none) {
-                        @panic("TODO: handle type check error");
-                    }
-
-                    const typed_inst = lower.emit(.{
-                        .pos = inst.pos,
-                        .type = type_id,
-                        .tag = switch (inst.tag) {
-                            .add => .add,
-                            .subtract => .subtract,
-                            .mul => .mul,
-                            .div => .div,
-                            .mod => .mod,
-                            else => unreachable,
-                        },
-                        .data = .{ .bin_op = .{ .lhs = lhs_ref, .rhs = rhs_ref } },
-                    });
-                    break :blk .{ .runtime = typed_inst };
-                }
-            },
-            .exec => @panic("TODO"),
-        },
+        .add, .subtract, .mul, .div, .mod => lowerInfixOp(state, inst_id, res_type, mode),
 
         .global_ptr, .global_val => @panic("TODO: global name resolve"),
 
@@ -295,65 +187,221 @@ pub fn lowerInst(lower: *State, inst_id: UntypedIr.InstId, res_type: ResultType,
             .emit => blk: {
                 // TODO: remove ret_implicit based on coverage
 
-                const val = lower.ref(inst.data.unary_op);
-                const typed_inst = lower.emit(.{
+                const val = state.ref(inst.data.unary_op);
+                const typed_inst = state.emit(.{
                     .pos = inst.pos,
                     .tag = .ret,
-                    .type = lower.ctx.type_pool.literal(.noreturn),
+                    .type = state.ctx.type_pool.literal(.noreturn),
                     .data = .{ .unary_op = val },
                 });
-                break :blk .{ .runtime = typed_inst };
+                break :blk .{ .value = .{ .runtime = typed_inst } };
             },
             .exec => @panic("TODO"),
         },
 
-        .type_lit => .{ .known = .{
-            .type = lower.ctx.type_pool.literal(.type_id),
-            .val = .{ .type = lower.ctx.type_pool.literal(inst.data.type_lit) },
-        } },
-
-        .undef_lit => .{ .known = .{
-            .type = lower.ctx.type_pool.literal(.comp_undef),
-            .val = .undef,
-        } },
-
-        .num_lit => blk: {
-            const num_token = lexer.lexToken(file.contents, inst.pos);
-            debug.assert(num_token.tag == .num_literal, "num lit lexed token invalid");
-            const num_str = file.contents[num_token.start..num_token.end];
-            const num = math.parseInt(i64, num_str) catch @panic("TODO: handle invalid num");
-            break :blk .{ .known = .{
-                .type = lower.ctx.type_pool.literal(.comp_int),
-                .val = .{ .number = num },
-            } };
-        },
-
-        .bool_lit => .{ .known = .{
-            .type = lower.ctx.type_pool.literal(.bool),
-            .val = .{ .boolean = inst.data.bool_lit },
-        } },
-
-        .type_of => .{ .known = .{
-            .type = lower.ctx.type_pool.literal(.type_id),
-            .val = .{ .type = lower.typeOf(inst.data.unary_op) },
-        } },
-
-        .fn_type => blk: {
-            const ret = lower.results[@backingInt(inst.data.fn_type.return_type)].known.val.type;
-            const args = lower.arena.pushArray(Type.Id, inst.data.fn_type.arg_types.count);
-            for (0..inst.data.fn_type.arg_types.count) |i| {
-                const arg = file.untyped_ir.extras[inst.data.fn_type.arg_types.offset + i];
-                args[i] = lower.results[@backingInt(arg)].known.val.type;
-            }
-            break :blk .{ .known = .{
-                .type = lower.ctx.type_pool.literal(.type_id),
-                .val = .{ .type = lower.ctx.type_pool.func(ret, args) },
-            } };
-        },
-
         else => @panic("TODO"),
     };
-    return .none;
+    state.results[@backingInt(inst_id)] = res.value;
+    return res;
+}
+
+const Result = struct {
+    value: Value,
+    control: union(enum) {
+        none,
+        ret,
+        brk: UntypedIr.InstId,
+    } = .none,
+};
+
+fn lowerStore(state: *State, inst_id: UntypedIr.InstId, mode: Mode) Result {
+    const inst = state.untyped_ir.getInst(inst_id);
+    return switch (mode) {
+        .emit => {
+            const addr = state.ref(inst.data.bin_op.lhs);
+            const rhs = state.ref(inst.data.bin_op.rhs);
+
+            // TODO: coerce lhs to rhs pointer
+            const typed_inst = state.emit(.{
+                .type = state.ctx.type_pool.literal(.void),
+                .pos = inst.pos,
+                .tag = .store,
+                .data = .{ .bin_op = .{ .lhs = addr, .rhs = rhs } },
+            });
+            return .{ .value = .{ .runtime = typed_inst } };
+        },
+        .exec => @panic("TODO"),
+    };
+}
+
+fn lowerLoad(state: *State, inst_id: UntypedIr.InstId, mode: Mode) Result {
+    const inst = state.untyped_ir.getInst(inst_id);
+    switch (mode) {
+        .emit => {
+            const addr = state.ref(inst.data.unary_op);
+            const addr_inst = state.typed_ir.getInst(addr);
+            const typed_inst = state.emit(.{
+                .type = state.ctx.type_pool.getType(addr_inst.type).data.ptr,
+                .pos = inst.pos,
+                .tag = .load,
+                .data = .{ .unary_op = addr },
+            });
+            return .{ .value = .{ .runtime = typed_inst } };
+        },
+        .exec => @panic("TODO"),
+    }
+}
+
+fn lowerAlloc(state: *State, inst_id: UntypedIr.InstId, mode: Mode) Result {
+    const inst = state.untyped_ir.getInst(inst_id);
+    return switch (mode) {
+        .emit => {
+            const type_id = state.results[@backingInt(inst.data.unary_op)].known.val.type;
+            const typed_inst = state.emit(.{
+                .type = state.ctx.type_pool.ptr(type_id),
+                .pos = inst.pos,
+                .tag = .alloc,
+                .data = .{ .alloc = type_id },
+            });
+            return .{ .value = .{ .runtime = typed_inst } };
+        },
+        .exec => @panic("TODO"),
+    };
+}
+
+fn lowerCompBlock(
+    state: *State,
+    inst_id: UntypedIr.InstId,
+    res_type: ResultType,
+    mode: Mode,
+) Result {
+    const inst = state.untyped_ir.getInst(inst_id);
+    return switch (mode) {
+        .emit => {
+            const res = lowerInst(state, inst_id, res_type, .exec);
+            debug.assert(res.control == .none, "comp block cannot break in emit");
+            return .{ .value = state.results[@backingInt(inst_id)] };
+        },
+        .exec => {
+            for (0..inst.data.block.count) |inst_idx| {
+                const child_id = state.untyped_ir.extras[inst.data.block.offset + inst_idx];
+                const res = lowerInst(state, child_id, res_type, .exec);
+                switch (res.control) {
+                    .none => {},
+                    .ret => @panic("TODO"),
+                    .brk => |block| if (block == inst_id)
+                        return .{ .value = res.value }
+                    else
+                        return res,
+                }
+            }
+            @panic("block did not end with break");
+        },
+    };
+}
+
+fn lowerInfixOp(state: *State, inst_id: UntypedIr.InstId, res_type: ResultType, mode: Mode) Result {
+    _ = res_type;
+    const inst = state.untyped_ir.getInst(inst_id);
+    return switch (mode) {
+        .emit => {
+            const lhs = state.results[@backingInt(inst.data.bin_op.lhs)];
+            const rhs = state.results[@backingInt(inst.data.bin_op.rhs)];
+            if (lhs == .known and rhs == .known) {
+                @panic("TODO");
+            } else {
+                const lhs_ref = state.ref(inst.data.bin_op.lhs);
+                const rhs_ref = state.ref(inst.data.bin_op.rhs);
+
+                const lhs_type = state.typed_ir.getInst(lhs_ref).type;
+                const rhs_type = state.typed_ir.getInst(rhs_ref).type;
+                const type_id = peerType(state.ctx, lhs_type, rhs_type);
+                if (type_id == .none) {
+                    @panic("TODO: handle type check error");
+                }
+
+                const typed_inst = state.emit(.{
+                    .pos = inst.pos,
+                    .type = type_id,
+                    .tag = switch (inst.tag) {
+                        .add => .add,
+                        .subtract => .subtract,
+                        .mul => .mul,
+                        .div => .div,
+                        .mod => .mod,
+                        else => unreachable,
+                    },
+                    .data = .{ .bin_op = .{ .lhs = lhs_ref, .rhs = rhs_ref } },
+                });
+                return .{ .value = .{ .runtime = typed_inst } };
+            }
+        },
+        .exec => @panic("TODO"),
+    };
+}
+
+fn lowerFnLit(state: *State, inst_id: UntypedIr.InstId, mode: Mode) Result {
+    const inst = state.untyped_ir.getInst(inst_id);
+    switch (mode) {
+        .emit => {
+            const marker = state.inst_count;
+            for (0..inst.data.fn_lit.body.count) |inst_idx| {
+                const id = state.untyped_ir.extras[inst.data.fn_lit.body.offset + inst_idx];
+                const jump = lowerInst(state, id, .implicit, .emit);
+                debug.assert(jump.control == .none, "emit mode should not jump");
+            }
+            const block = state.insts[marker..state.inst_count];
+            state.inst_count = marker;
+
+            const typed_inst = state.emit(.{
+                .pos = inst.pos,
+                .type = state.results[@backingInt(inst_id)].known.type,
+                .tag = .func,
+                .data = .{ .block = state.typed_ir.allocList(block) },
+            });
+            return .{ .value = .{ .runtime = typed_inst } };
+        },
+        .exec => {
+            const type_res = state.results[@backingInt(inst.data.fn_lit.type)];
+            const func_id = state.ctx.func_table.add(.{
+                .file = state.file_id,
+                .type = type_res.known.val.type,
+                .untyped_inst = inst_id,
+                .status = .unchecked,
+            });
+            return .{ .value = .{ .known = .{
+                .type = type_res.known.val.type,
+                .val = .{ .fn_lit = func_id },
+            } } };
+        },
+    }
+}
+
+fn lowerNumLit(state: *State, inst_id: UntypedIr.InstId) Result {
+    const file = state.ctx.getFile(state.file_id);
+    const inst = state.untyped_ir.getInst(inst_id);
+    const num_token = lexer.lexToken(file.contents, inst.pos);
+    debug.assert(num_token.tag == .num_literal, "num lit lexed token invalid");
+    const num_str = file.contents[num_token.start..num_token.end];
+    const num = math.parseInt(i64, num_str) catch @panic("TODO: handle invalid num");
+    return .{ .value = .{ .known = .{
+        .type = state.ctx.type_pool.literal(.comp_int),
+        .val = .{ .number = num },
+    } } };
+}
+
+fn lowerFnType(state: *State, inst_id: UntypedIr.InstId) Result {
+    const inst = state.untyped_ir.getInst(inst_id);
+    const ret = state.results[@backingInt(inst.data.fn_type.return_type)].known.val.type;
+    const args = state.arena.pushArray(Type.Id, inst.data.fn_type.arg_types.count);
+    for (0..inst.data.fn_type.arg_types.count) |i| {
+        const arg = state.untyped_ir.extras[inst.data.fn_type.arg_types.offset + i];
+        args[i] = state.results[@backingInt(arg)].known.val.type;
+    }
+    return .{ .value = .{ .known = .{
+        .type = state.ctx.type_pool.literal(.type_id),
+        .val = .{ .type = state.ctx.type_pool.func(ret, args) },
+    } } };
 }
 
 fn coerce(ctx: *Context, from_id: Type.Id, to_id: Type.Id) bool {
