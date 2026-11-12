@@ -343,15 +343,13 @@ pub fn lowerFile(ctx: *Context, arena: *mem.Arena, file_id: File.Id, root_id: As
         const decl_node = state.ast.getNode(global);
         const param_node = state.ast.getNode(decl_node.data.decl.param);
 
-        const type_inst = if (param_node.data.param.type != .none) blk: {
-            state.beginCompileBlock();
-            const res = lower(state, param_node.data.param.type);
-            break :blk state.emitBlock(param_node.pos, res);
-        } else .none;
-
-        const value_node = state.ast.getNode(decl_node.data.decl.value);
         state.beginCompileBlock();
-        const res = lower(state, decl_node.data.decl.value);
+        const type_inst = if (param_node.data.param.type != .none)
+            lower(state, param_node.data.param.type, .none)
+        else
+            .none;
+        const value_node = state.ast.getNode(decl_node.data.decl.value);
+        const res = lower(state, decl_node.data.decl.value, type_inst);
         const value_inst = state.emitBlock(value_node.pos, res);
 
         result[result_count] = .{
@@ -428,17 +426,17 @@ fn lowerPtr(state: *State, node_id: Ast.NodeId) Ir.InstId {
 }
 
 const max_fn_args = 1024;
-fn lower(state: *State, node_id: Ast.NodeId) Ir.InstId {
+fn lower(state: *State, node_id: Ast.NodeId, res_type: Ir.InstId) Ir.InstId {
     debug.assert(node_id != .none, "lower none node");
     if (node_id == .poison) return .poison;
 
     const node = state.ast.getNode(node_id);
-    return switch (node.tag) {
+    const value = switch (node.tag) {
         .block => blk: {
             state.beginBlock();
             for (0..node.data.block.count) |child_idx| {
                 const child = state.ast.extras[node.data.block.offset + child_idx];
-                _ = lower(state, child);
+                _ = lower(state, child, .none);
             }
             break :blk state.emitBlock(node.pos, .none);
         },
@@ -466,8 +464,7 @@ fn lower(state: *State, node_id: Ast.NodeId) Ir.InstId {
 
         .fn_lit => blk: {
             state.beginCompileBlock();
-            const type_inst = lower(state, node.data.fn_lit.fn_type);
-
+            const type_inst = lower(state, node.data.fn_lit.fn_type, .none);
             const lit = blk1: {
                 state.beginFnBlock(type_inst);
                 const type_node = state.ast.getNode(node.data.fn_lit.fn_type);
@@ -509,7 +506,7 @@ fn lower(state: *State, node_id: Ast.NodeId) Ir.InstId {
                 const body_nodes = state.ast.getNode(node.data.fn_lit.block).data.block;
                 for (0..body_nodes.count) |body_node_idx| {
                     const body_node = state.ast.extras[body_nodes.offset + body_node_idx];
-                    _ = lower(state, body_node);
+                    _ = lower(state, body_node, .none);
                 }
                 break :blk1 state.emitBlock(node.pos, .none);
             };
@@ -527,11 +524,11 @@ fn lower(state: *State, node_id: Ast.NodeId) Ir.InstId {
             for (0..params_node.data.block.count) |arg_i| {
                 const arg = state.ast.extras[params_node.data.block.offset + arg_i];
                 const arg_node = state.ast.getNode(arg);
-                arg_buf[arg_count] = lower(state, arg_node.data.param.type);
+                arg_buf[arg_count] = lower(state, arg_node.data.param.type, .none);
                 arg_count += 1;
             }
 
-            const return_type = lower(state, node.data.fn_type.return_type);
+            const return_type = lower(state, node.data.fn_type.return_type, .none);
             const res = state.emit(.{
                 .pos = node.pos,
                 .tag = .fn_type,
@@ -544,13 +541,15 @@ fn lower(state: *State, node_id: Ast.NodeId) Ir.InstId {
         },
 
         .const_decl => blk: {
-            const param = state.ast.getNode(node.data.decl.param);
-            if (param.data.param.type != .none) {
-                @panic("TODO: explicitly typed local constants");
-            }
-
             state.beginCompileBlock();
-            const res = lower(state, node.data.decl.value);
+
+            const param = state.ast.getNode(node.data.decl.param);
+            const type_inst = if (param.data.param.type != .none)
+                lower(state, param.data.param.type, .none)
+            else
+                .none;
+
+            const res = lower(state, node.data.decl.value, type_inst);
             const inst = state.emitBlock(node.pos, res);
 
             const name = Name{
@@ -580,23 +579,23 @@ fn lower(state: *State, node_id: Ast.NodeId) Ir.InstId {
             break :blk inst;
         },
         .var_decl => blk: {
-            const value_inst = lower(state, node.data.decl.value);
-
             const param = state.ast.getNode(node.data.decl.param);
             const type_inst = if (param.data.param.type != .none) blk1: {
                 state.beginCompileBlock();
-                const res = lower(state, param.data.param.type);
+                const res = lower(state, param.data.param.type, .none);
                 break :blk1 state.emitBlock(node.pos, res);
-            } else state.emit(.{
-                .pos = node.pos,
+            } else .none;
+
+            const value_inst = lower(state, node.data.decl.value, type_inst);
+            const value_type = state.emit(.{
+                .pos = param.pos,
                 .tag = .type_of,
                 .data = .{ .unary_op = value_inst },
             });
-
             const inst = state.emit(.{
                 .pos = param.pos,
                 .tag = .alloc,
-                .data = .{ .unary_op = type_inst },
+                .data = .{ .unary_op = value_type },
             });
             _ = state.emit(.{
                 .pos = node.pos,
@@ -670,8 +669,9 @@ fn lower(state: *State, node_id: Ast.NodeId) Ir.InstId {
         },
 
         .assign => blk: {
+            debug.assert(res_type == .none, "");
             const lvalue = lowerPtr(state, node.data.bin_op.lhs);
-            const rvalue = lower(state, node.data.bin_op.rhs);
+            const rvalue = lower(state, node.data.bin_op.rhs, .none);
             break :blk state.emit(.{
                 .pos = node.pos,
                 .tag = .store,
@@ -683,8 +683,8 @@ fn lower(state: *State, node_id: Ast.NodeId) Ir.InstId {
         },
 
         .add, .subtract, .mul, .div, .mod => blk: {
-            const lhs = lower(state, node.data.bin_op.lhs);
-            const rhs = lower(state, node.data.bin_op.rhs);
+            const lhs = lower(state, node.data.bin_op.lhs, .none);
+            const rhs = lower(state, node.data.bin_op.rhs, .none);
             break :blk state.emit(.{
                 .pos = node.pos,
                 .tag = switch (node.tag) {
@@ -706,7 +706,7 @@ fn lower(state: *State, node_id: Ast.NodeId) Ir.InstId {
             const value = if (node.data.unary_op == .none)
                 .none
             else
-                lower(state, node.data.unary_op);
+                lower(state, node.data.unary_op, .none);
 
             break :blk state.emit(.{
                 .pos = node.pos,
@@ -715,7 +715,7 @@ fn lower(state: *State, node_id: Ast.NodeId) Ir.InstId {
             });
         },
         .negate => blk: {
-            const value = lower(state, node.data.unary_op);
+            const value = lower(state, node.data.unary_op, .none);
             break :blk state.emit(.{
                 .pos = node.pos,
                 .tag = switch (node.tag) {
@@ -728,4 +728,15 @@ fn lower(state: *State, node_id: Ast.NodeId) Ir.InstId {
 
         .file, .param, .params => @panic("lower invalid node"),
     };
+
+    if (res_type != .none) {
+        const cast = state.emit(.{
+            .pos = node.pos,
+            .tag = .coerce_type,
+            .data = .{ .bin_op = .{ .lhs = res_type, .rhs = value } },
+        });
+        return cast;
+    }
+
+    return value;
 }

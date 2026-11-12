@@ -28,8 +28,20 @@ pub const Known = struct {
 
 const Value = union(enum) {
     none,
+    poison,
     known: Known,
     runtime: TypedIr.InstId,
+
+    fn expectType(value: Value) !Type.Id {
+        return switch (value) {
+            .none, .poison => @panic("none, poison type"),
+            .runtime => error.RuntimeInst,
+            .known => |known| switch (known.val) {
+                .type => |t| t,
+                else => error.InvalidType,
+            },
+        };
+    }
 };
 
 pub const State = struct {
@@ -73,17 +85,28 @@ pub const State = struct {
         return inst_id;
     }
 
-    fn typeOf(lower: *State, inst_id: UntypedIr.InstId) Type.Id {
-        return switch (lower.results[@backingInt(inst_id)]) {
+    fn typeOf(lower: *State, value: Value) Type.Id {
+        return switch (value) {
             .none => @panic("type of none value"),
+            .poison => @panic("type of poison"),
             .known => |val| val.type,
             .runtime => |child_id| lower.typed_ir.getInst(child_id).type,
         };
     }
 
-    fn ref(lower: *State, inst_id: UntypedIr.InstId) TypedIr.InstId {
-        if (inst_id == .none) return .none;
-        return switch (lower.results[@backingInt(inst_id)]) {
+    fn getOperand(state: *State, inst_id: UntypedIr.InstId) ?Value {
+        debug.assert(inst_id != .none, "get none operand");
+        if (inst_id == .poison) return null;
+        const val = state.results[@backingInt(inst_id)];
+        return switch (val) {
+            .none => @panic("get none operand"),
+            .poison => null,
+            .known, .runtime => val,
+        };
+    }
+
+    fn ref(lower: *State, val: Value) TypedIr.InstId {
+        return switch (val) {
             .known => |value| blk: {
                 const const_id = switch (value.val) {
                     .undef => lower.ctx.constant_pool.undef(),
@@ -101,8 +124,51 @@ pub const State = struct {
                 });
             },
             .runtime => |i| i,
+            .poison => @panic("ref of poison"),
             .none => @panic("invalid ref for none inst"),
         };
+    }
+
+    fn coerce(state: *State, val: Value, t_id: Type.Id) !Value {
+        switch (val) {
+            .none, .poison => @panic("cast on none/poison"),
+            .known => |known| {
+                if (known.type == t_id) return val;
+
+                const known_type = state.ctx.type_pool.getType(known.type);
+                const t = state.ctx.type_pool.getType(t_id);
+
+                if (known_type.tag == .lit and t.tag == .lit) {
+                    if (known_type.data.lit == .comp_int) {
+                        // TODO: bounds check
+                        switch (t.data.lit) {
+                            .u8, .u16, .u32, .u64, .usize, .i8, .i16, .i32, .i64, .isize => {
+                                return .{ .known = .{ .type = t_id, .val = known.val } };
+                            },
+                            else => {},
+                        }
+                    }
+                }
+                return error.IncompatibleTypes;
+            },
+            .runtime => |inst_id| {
+                const inst = state.typed_ir.getInst(inst_id);
+                if (inst.type == t_id) return val;
+                return error.IncompatibleTypes;
+            },
+        }
+    }
+
+    fn peerType(state: *State, t1_id: Type.Id, t2_id: Type.Id) !Type.Id {
+        if (t1_id == t2_id) return t1_id;
+        const t1 = state.ctx.type_pool.getType(t1_id);
+        const t2 = state.ctx.type_pool.getType(t2_id);
+        if (t1.tag == .lit and t2.tag == .lit) {
+            if (t1.data.lit == .comp_int) return t2_id;
+            if (t2.data.lit == .comp_int) return t1_id;
+        }
+
+        return error.IncompatibleTypes;
     }
 };
 
@@ -113,25 +179,19 @@ pub fn evalBlock(
     arena: *mem.Arena,
     file_id: File.Id,
     inst_id: UntypedIr.InstId,
-    res_type: ResultType,
 ) *State {
     const state = State.init(ctx, file_id, arena);
-    const res = lowerInst(state, inst_id, res_type, .exec);
+    const res = lowerInst(state, inst_id, .exec);
     debug.assert(res.control == .none, "global block must break to itself");
     return state;
 }
 
 const Mode = enum { emit, exec };
 
-pub fn lowerInst(
-    state: *State,
-    inst_id: UntypedIr.InstId,
-    res_type: ResultType,
-    mode: Mode,
-) Result {
+pub fn lowerInst(state: *State, inst_id: UntypedIr.InstId, mode: Mode) Result {
     const inst = state.untyped_ir.getInst(inst_id);
     const res: Result = switch (inst.tag) {
-        .comp_block => lowerCompBlock(state, inst_id, res_type, mode),
+        .comp_block => lowerCompBlock(state, inst_id, mode),
         .fn_lit => lowerFnLit(state, inst_id, mode),
 
         .alloc => lowerAlloc(state, inst_id, mode),
@@ -156,15 +216,46 @@ pub fn lowerInst(
             .val = .{ .boolean = inst.data.bool_lit },
         } } },
 
-        .type_of => .{ .value = .{ .known = .{
-            .type = state.ctx.type_pool.literal(.type_id),
-            .val = .{ .type = state.typeOf(inst.data.unary_op) },
-        } } },
+        .type_of => blk: {
+            const val = state.getOperand(inst.data.unary_op) orelse {
+                break :blk .{ .value = .poison };
+            };
+            break :blk .{ .value = .{ .known = .{
+                .type = state.ctx.type_pool.literal(.type_id),
+                .val = .{ .type = state.typeOf(val) },
+            } } };
+        },
+
+        .coerce_type => blk: {
+            const type_value = state.getOperand(inst.data.bin_op.lhs) orelse {
+                break :blk .{ .value = .poison };
+            };
+            const type_id = type_value.expectType() catch {
+                state.ctx.addMsg(.{
+                    .severity = .err,
+                    .pos = .{ .file = state.file_id, .offset = inst.pos },
+                    .data = .expected_type,
+                });
+                break :blk .{ .value = .poison };
+            };
+            const value = state.getOperand(inst.data.bin_op.rhs) orelse {
+                break :blk .{ .value = .poison };
+            };
+            const cast_val = state.coerce(value, type_id) catch err: {
+                state.ctx.addMsg(.{
+                    .severity = .err,
+                    .pos = .{ .file = state.file_id, .offset = inst.pos },
+                    .data = .incompatible_cast,
+                });
+                break :err .poison;
+            };
+            break :blk .{ .value = cast_val };
+        },
 
         .brk => switch (mode) {
             .emit => @panic("TODO"),
             .exec => return .{
-                .value = state.results[@backingInt(inst.data.bin_op.rhs)],
+                .value = state.getOperand(inst.data.bin_op.rhs) orelse .poison,
                 .control = .{ .brk = inst.data.bin_op.lhs },
             },
         },
@@ -179,15 +270,30 @@ pub fn lowerInst(
             },
         },
 
-        .add, .subtract, .mul, .div, .mod => lowerInfixOp(state, inst_id, res_type, mode),
+        .add, .subtract, .mul, .div, .mod => lowerInfixOp(state, inst_id, mode),
 
         .global_ptr, .global_val => @panic("TODO: global name resolve"),
 
-        .ret, .ret_implicit => switch (mode) {
+        .ret_implicit => switch (mode) {
             .emit => blk: {
-                // TODO: remove ret_implicit based on coverage
-
-                const val = state.ref(inst.data.unary_op);
+                const typed_inst = state.emit(.{
+                    .pos = inst.pos,
+                    .tag = .ret,
+                    .type = state.ctx.type_pool.literal(.noreturn),
+                    .data = .{ .unary_op = .none },
+                });
+                break :blk .{ .value = .{ .runtime = typed_inst } };
+            },
+            .exec => @panic("TODO"),
+        },
+        .ret => switch (mode) {
+            .emit => blk: {
+                const val = if (inst.data.unary_op != .none) blk1: {
+                    const value = state.getOperand(inst.data.unary_op) orelse {
+                        break :blk .{ .value = .poison };
+                    };
+                    break :blk1 state.ref(value);
+                } else .none;
                 const typed_inst = state.emit(.{
                     .pos = inst.pos,
                     .tag = .ret,
@@ -202,6 +308,8 @@ pub fn lowerInst(
         else => @panic("TODO"),
     };
     state.results[@backingInt(inst_id)] = res.value;
+
+    // debug.log("%{} = {}", .{ @backingInt(inst_id), res.value });
     return res;
 }
 
@@ -216,17 +324,38 @@ const Result = struct {
 
 fn lowerStore(state: *State, inst_id: UntypedIr.InstId, mode: Mode) Result {
     const inst = state.untyped_ir.getInst(inst_id);
+
+    const addr = state.getOperand(inst.data.bin_op.lhs) orelse return .{ .value = .poison };
+    const addr_type_id = state.typeOf(addr);
+    const addr_type = state.ctx.type_pool.getType(addr_type_id);
+    if (addr_type.tag != .ptr) {
+        state.ctx.addMsg(.{
+            .severity = .err,
+            .pos = .{ .file = state.file_id, .offset = inst.pos },
+            .data = .exptected_ptr,
+        });
+        return .{ .value = .poison };
+    }
+
+    const rhs = state.getOperand(inst.data.bin_op.rhs) orelse return .{ .value = .poison };
+    const value = state.coerce(rhs, addr_type.data.ptr) catch {
+        state.ctx.addMsg(.{
+            .severity = .err,
+            .pos = .{ .file = state.file_id, .offset = inst.pos },
+            .data = .incompatible_cast,
+        });
+        return .{ .value = .poison };
+    };
+
     return switch (mode) {
         .emit => {
-            const addr = state.ref(inst.data.bin_op.lhs);
-            const rhs = state.ref(inst.data.bin_op.rhs);
-
-            // TODO: coerce lhs to rhs pointer
+            const addr_ref = state.ref(addr);
+            const val_ref = state.ref(value);
             const typed_inst = state.emit(.{
                 .type = state.ctx.type_pool.literal(.void),
                 .pos = inst.pos,
                 .tag = .store,
-                .data = .{ .bin_op = .{ .lhs = addr, .rhs = rhs } },
+                .data = .{ .bin_op = .{ .lhs = addr_ref, .rhs = val_ref } },
             });
             return .{ .value = .{ .runtime = typed_inst } };
         },
@@ -236,15 +365,18 @@ fn lowerStore(state: *State, inst_id: UntypedIr.InstId, mode: Mode) Result {
 
 fn lowerLoad(state: *State, inst_id: UntypedIr.InstId, mode: Mode) Result {
     const inst = state.untyped_ir.getInst(inst_id);
+    const op = state.getOperand(inst.data.unary_op) orelse return .{ .value = .poison };
+    const op_type_id = state.typeOf(op);
+    const op_type = state.ctx.type_pool.getType(op_type_id);
+    debug.assert(op_type.tag == .ptr, "load must be ptr");
     switch (mode) {
         .emit => {
-            const addr = state.ref(inst.data.unary_op);
-            const addr_inst = state.typed_ir.getInst(addr);
+            const addr_ref = state.ref(op);
             const typed_inst = state.emit(.{
-                .type = state.ctx.type_pool.getType(addr_inst.type).data.ptr,
+                .type = op_type.data.ptr,
                 .pos = inst.pos,
                 .tag = .load,
-                .data = .{ .unary_op = addr },
+                .data = .{ .unary_op = addr_ref },
             });
             return .{ .value = .{ .runtime = typed_inst } };
         },
@@ -254,9 +386,33 @@ fn lowerLoad(state: *State, inst_id: UntypedIr.InstId, mode: Mode) Result {
 
 fn lowerAlloc(state: *State, inst_id: UntypedIr.InstId, mode: Mode) Result {
     const inst = state.untyped_ir.getInst(inst_id);
+    const type_val = state.getOperand(inst.data.unary_op) orelse return .{ .value = .poison };
+    const type_id = type_val.expectType() catch {
+        state.ctx.addMsg(.{
+            .severity = .err,
+            .pos = .{ .file = state.file_id, .offset = inst.pos },
+            .data = .expected_type,
+        });
+        return .{ .value = .poison };
+    };
+    const op_type = state.ctx.type_pool.getType(type_id);
+    switch (op_type.tag) {
+        .lit => switch (op_type.data.lit) {
+            .comp_float, .comp_int, .comp_undef => {
+                state.ctx.addMsg(.{
+                    .pos = .{ .file = state.file_id, .offset = inst.pos },
+                    .severity = .err,
+                    .data = .addr_of_comp_type,
+                });
+                return .{ .value = .poison };
+            },
+            else => {},
+        },
+        else => {},
+    }
+
     return switch (mode) {
         .emit => {
-            const type_id = state.results[@backingInt(inst.data.unary_op)].known.val.type;
             const typed_inst = state.emit(.{
                 .type = state.ctx.type_pool.ptr(type_id),
                 .pos = inst.pos,
@@ -269,23 +425,18 @@ fn lowerAlloc(state: *State, inst_id: UntypedIr.InstId, mode: Mode) Result {
     };
 }
 
-fn lowerCompBlock(
-    state: *State,
-    inst_id: UntypedIr.InstId,
-    res_type: ResultType,
-    mode: Mode,
-) Result {
+fn lowerCompBlock(state: *State, inst_id: UntypedIr.InstId, mode: Mode) Result {
     const inst = state.untyped_ir.getInst(inst_id);
     return switch (mode) {
         .emit => {
-            const res = lowerInst(state, inst_id, res_type, .exec);
+            const res = lowerInst(state, inst_id, .exec);
             debug.assert(res.control == .none, "comp block cannot break in emit");
             return .{ .value = state.results[@backingInt(inst_id)] };
         },
         .exec => {
             for (0..inst.data.block.count) |inst_idx| {
                 const child_id = state.untyped_ir.extras[inst.data.block.offset + inst_idx];
-                const res = lowerInst(state, child_id, res_type, .exec);
+                const res = lowerInst(state, child_id, .exec);
                 switch (res.control) {
                     .none => {},
                     .ret => @panic("TODO"),
@@ -300,29 +451,50 @@ fn lowerCompBlock(
     };
 }
 
-fn lowerInfixOp(state: *State, inst_id: UntypedIr.InstId, res_type: ResultType, mode: Mode) Result {
-    _ = res_type;
+fn lowerInfixOp(state: *State, inst_id: UntypedIr.InstId, mode: Mode) Result {
     const inst = state.untyped_ir.getInst(inst_id);
+    const lhs = state.getOperand(inst.data.bin_op.lhs) orelse return .{ .value = .poison };
+    const rhs = state.getOperand(inst.data.bin_op.rhs) orelse return .{ .value = .poison };
+
+    const lhs_type_id = state.typeOf(lhs);
+    const rhs_type_id = state.typeOf(rhs);
+    const peer_type_id = state.peerType(lhs_type_id, rhs_type_id) catch {
+        state.ctx.addMsg(.{
+            .severity = .err,
+            .pos = .{ .file = state.file_id, .offset = inst.pos },
+            .data = .incompatible_peer_types,
+        });
+        return .{ .value = .poison };
+    };
+
+    const lhs_cast = state.coerce(lhs, peer_type_id) catch {
+        state.ctx.addMsg(.{
+            .severity = .err,
+            .pos = .{ .file = state.file_id, .offset = inst.pos },
+            .data = .incompatible_cast,
+        });
+        return .{ .value = .poison };
+    };
+    const rhs_cast = state.coerce(rhs, peer_type_id) catch {
+        state.ctx.addMsg(.{
+            .severity = .err,
+            .pos = .{ .file = state.file_id, .offset = inst.pos },
+            .data = .incompatible_cast,
+        });
+        return .{ .value = .poison };
+    };
+
     return switch (mode) {
         .emit => {
-            const lhs = state.results[@backingInt(inst.data.bin_op.lhs)];
-            const rhs = state.results[@backingInt(inst.data.bin_op.rhs)];
             if (lhs == .known and rhs == .known) {
                 @panic("TODO");
             } else {
-                const lhs_ref = state.ref(inst.data.bin_op.lhs);
-                const rhs_ref = state.ref(inst.data.bin_op.rhs);
-
-                const lhs_type = state.typed_ir.getInst(lhs_ref).type;
-                const rhs_type = state.typed_ir.getInst(rhs_ref).type;
-                const type_id = peerType(state.ctx, lhs_type, rhs_type);
-                if (type_id == .none) {
-                    @panic("TODO: handle type check error");
-                }
+                const lhs_ref = state.ref(lhs_cast);
+                const rhs_ref = state.ref(rhs_cast);
 
                 const typed_inst = state.emit(.{
                     .pos = inst.pos,
-                    .type = type_id,
+                    .type = peer_type_id,
                     .tag = switch (inst.tag) {
                         .add => .add,
                         .subtract => .subtract,
@@ -347,7 +519,7 @@ fn lowerFnLit(state: *State, inst_id: UntypedIr.InstId, mode: Mode) Result {
             const marker = state.inst_count;
             for (0..inst.data.fn_lit.body.count) |inst_idx| {
                 const id = state.untyped_ir.extras[inst.data.fn_lit.body.offset + inst_idx];
-                const jump = lowerInst(state, id, .implicit, .emit);
+                const jump = lowerInst(state, id, .emit);
                 debug.assert(jump.control == .none, "emit mode should not jump");
             }
             const block = state.insts[marker..state.inst_count];
@@ -362,7 +534,9 @@ fn lowerFnLit(state: *State, inst_id: UntypedIr.InstId, mode: Mode) Result {
             return .{ .value = .{ .runtime = typed_inst } };
         },
         .exec => {
-            const type_res = state.results[@backingInt(inst.data.fn_lit.type)];
+            const type_res = state.getOperand(inst.data.fn_lit.type) orelse {
+                return .{ .value = .poison };
+            };
             const func_id = state.ctx.func_table.add(.{
                 .file = state.file_id,
                 .type = type_res.known.val.type,
@@ -392,33 +566,35 @@ fn lowerNumLit(state: *State, inst_id: UntypedIr.InstId) Result {
 
 fn lowerFnType(state: *State, inst_id: UntypedIr.InstId) Result {
     const inst = state.untyped_ir.getInst(inst_id);
-    const ret = state.results[@backingInt(inst.data.fn_type.return_type)].known.val.type;
+    const ret_value = state.getOperand(inst.data.fn_type.return_type) orelse {
+        return .{ .value = .poison };
+    };
+    const ret = ret_value.expectType() catch {
+        const ret_inst = state.untyped_ir.getInst(inst.data.fn_type.return_type);
+        state.ctx.addMsg(.{
+            .severity = .err,
+            .pos = .{ .file = state.file_id, .offset = ret_inst.pos },
+            .data = .expected_type,
+        });
+        return .{ .value = .poison };
+    };
+
     const args = state.arena.pushArray(Type.Id, inst.data.fn_type.arg_types.count);
     for (0..inst.data.fn_type.arg_types.count) |i| {
         const arg = state.untyped_ir.extras[inst.data.fn_type.arg_types.offset + i];
-        args[i] = state.results[@backingInt(arg)].known.val.type;
+        const arg_value = state.getOperand(arg) orelse return .{ .value = .poison };
+        args[i] = arg_value.expectType() catch {
+            const arg_inst = state.untyped_ir.getInst(arg);
+            state.ctx.addMsg(.{
+                .severity = .err,
+                .pos = .{ .file = state.file_id, .offset = arg_inst.pos },
+                .data = .expected_type,
+            });
+            return .{ .value = .poison };
+        };
     }
     return .{ .value = .{ .known = .{
         .type = state.ctx.type_pool.literal(.type_id),
         .val = .{ .type = state.ctx.type_pool.func(ret, args) },
     } } };
-}
-
-fn coerce(ctx: *Context, from_id: Type.Id, to_id: Type.Id) bool {
-    if (to_id == .none or from_id == to_id) return true;
-
-    const from = ctx.type_pool.getType(from_id);
-    if (from.tag == .lit) {
-        const from_lit = from.data.lit;
-        if (from_lit == .comp_undef) return true;
-
-        // TODO: allow comp int to coerce if value is in bounds
-    }
-    return false;
-}
-
-fn peerType(ctx: *Context, t1: Type.Id, t2: Type.Id) Type.Id {
-    _ = ctx;
-    if (t1 == t2) return t1;
-    return .none;
 }

@@ -172,7 +172,7 @@ pub fn debugPrintIr(
             debug.print("%{} = {s} #{s}\n", .{ @backingInt(inst_id), @tagName(inst.tag), str });
         },
 
-        .add, .subtract, .mul, .div, .mod, .store, .brk => {
+        .add, .subtract, .mul, .div, .mod, .store, .brk, .coerce_type => {
             debug.print("%{} = {s} %{} %{}\n", .{
                 @backingInt(inst_id),
                 @tagName(inst.tag),

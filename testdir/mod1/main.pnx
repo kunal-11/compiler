@@ -3,8 +3,8 @@ global :: 10;
 global_var := 20;
 
 main :: fn () void {
-	z := undefined;
-	b := 10;
+	z : u32 = 123;
+	b : u32 = 10;
 	z = b + 12;
 };
 

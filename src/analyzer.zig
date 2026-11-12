@@ -47,25 +47,14 @@ pub fn analyze(ctx: *Context, arena: *mem.Arena) void {
                 const symbol = ctx.symbol_table.get(decl);
                 const file = ctx.getFile(symbol.file);
 
-                const res_type: typed_lower.ResultType = if (symbol.type_inst != .none) blk: {
-                    const state = typed_lower.evalBlock(
-                        ctx,
-                        arena,
-                        symbol.file,
-                        symbol.type_inst,
-                        .{ .explicit = ctx.type_pool.literal(.type_id) },
-                    );
-                    break :blk .{ .explicit = state.results[@backingInt(symbol.type_inst)].known.val.type };
-                } else .implicit;
-
-                const state = typed_lower.evalBlock(
-                    ctx,
-                    arena,
-                    symbol.file,
-                    symbol.value_inst,
-                    res_type,
-                );
+                const state = typed_lower.evalBlock(ctx, arena, symbol.file, symbol.value_inst);
                 const result = state.results[@backingInt(symbol.value_inst)];
+
+                if (symbol.type_inst != .none) {
+                    const res = typed_lower.evalBlock(ctx, arena, symbol.file, symbol.type_inst);
+                    const type_id = res.results[@backingInt(symbol.type_inst)].known.val.type;
+                    if (type_id != result.known.type) @panic("TODO: handle type check failed");
+                }
 
                 switch (result.known.val) {
                     .fn_lit => {
@@ -86,12 +75,7 @@ pub fn analyze(ctx: *Context, arena: *mem.Arena) void {
                 const func = ctx.func_table.get(lit);
                 debug.assert(func.status == .queued, "fn check item invalid status");
 
-                const jump = typed_lower.lowerInst(
-                    func.status.queued,
-                    func.untyped_inst,
-                    .{ .explicit = func.type },
-                    .emit,
-                );
+                const jump = typed_lower.lowerInst(func.status.queued, func.untyped_inst, .emit);
                 debug.assert(jump.control == .none, "jump on emit mode lower");
                 const fn_inst = func.status.queued.results[@backingInt(func.untyped_inst)].runtime;
                 func.status = .{ .checked = fn_inst };

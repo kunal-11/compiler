@@ -25,6 +25,11 @@ pub const Message = struct {
         expected_type,
         expected_lvalue,
         name_shadows_type: TypeLit,
+
+        exptected_ptr,
+        addr_of_comp_type,
+        incompatible_peer_types,
+        incompatible_cast,
         unexpected_token: struct {
             expected: lexer.Tag,
         },
@@ -329,6 +334,7 @@ pub const UntypedIr = struct {
         ret, // unary_op - value
         ret_implicit, // unary_op - fn_lit id
 
+        coerce_type, // lhs - type inst, rhs - value
         type_of,
 
         global_ptr,
