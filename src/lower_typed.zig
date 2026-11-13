@@ -165,8 +165,6 @@ pub const State = struct {
     }
 };
 
-pub const ResultType = union(enum) { implicit, explicit: Type.Id };
-
 pub fn evalBlock(
     ctx: *Context,
     arena: *mem.Arena,

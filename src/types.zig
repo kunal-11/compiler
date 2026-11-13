@@ -223,10 +223,10 @@ pub const Symbol = struct {
 
     file: File.Id,
     pos: u32,
-    type_inst: UntypedIr.InstId = .none,
     value_inst: UntypedIr.InstId,
 
     tag: enum { variable, constant },
+    status: enum { unchecked, checked, check_failed },
 };
 
 pub const Ast = struct {

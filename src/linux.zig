@@ -98,9 +98,6 @@ fn loadFile(ctx: *Context, arena: *mem.Arena, ns_id: Namespace.Id, path: []const
             ctx.intern_pool.getString(decl.name),
             @tagName(decl.tag),
         });
-        if (decl.type != .none) {
-            printer.debugPrintIr(file_buf, untyped_ir, decl.type, 0);
-        }
         printer.debugPrintIr(file_buf, untyped_ir, decl.value, 0);
         debug.print("\n", .{});
 
@@ -112,7 +109,7 @@ fn loadFile(ctx: *Context, arena: *mem.Arena, ns_id: Namespace.Id, path: []const
             },
             .pos = decl.pos,
             .value_inst = decl.value,
-            .type_inst = decl.type,
+            .status = .unchecked,
         });
 
         switch (ns.add(decl.name, symbol_id)) {

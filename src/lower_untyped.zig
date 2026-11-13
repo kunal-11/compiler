@@ -312,8 +312,6 @@ pub const Decl = struct {
     pos: u32,
     name: InternPool.Id,
     tag: enum { var_decl, const_decl },
-
-    type: Ir.InstId,
     value: Ir.InstId,
 };
 
@@ -355,7 +353,6 @@ pub fn lowerFile(ctx: *Context, arena: *mem.Arena, file_id: File.Id, root_id: As
         result[result_count] = .{
             .pos = param_node.pos,
             .name = param_node.data.param.intern_id,
-            .type = type_inst,
             .value = value_inst,
             .tag = switch (decl_node.tag) {
                 .var_decl => .var_decl,

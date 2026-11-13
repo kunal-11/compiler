@@ -50,12 +50,12 @@ pub fn analyze(ctx: *Context, arena: *mem.Arena) void {
                 const state = typed_lower.evalBlock(ctx, arena, symbol.file, symbol.value_inst);
                 const result = state.results[@backingInt(symbol.value_inst)];
 
-                if (symbol.type_inst != .none) {
-                    const res = typed_lower.evalBlock(ctx, arena, symbol.file, symbol.type_inst);
-                    const type_id = res.results[@backingInt(symbol.type_inst)].known.val.type;
-                    if (type_id != result.known.type) @panic("TODO: handle type check failed");
+                if (result == .poison) {
+                    symbol.status = .check_failed;
+                    continue;
                 }
 
+                symbol.status = .checked;
                 switch (result.known.val) {
                     .fn_lit => {
                         const func = ctx.func_table.get(result.known.val.fn_lit);
