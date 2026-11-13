@@ -8,7 +8,7 @@ const Context = @import("types.zig").Context;
 const File = @import("types.zig").File;
 const Ast = @import("types.zig").Ast;
 const InternPool = @import("types.zig").InternPool;
-const TypeLit = @import("types.zig").TypeLit;
+const Type = @import("types.zig").Type;
 
 const TokenCache = struct {
     buf: []const u8,
@@ -134,7 +134,7 @@ pub fn parseFile(ctx: *Context, arena: *mem.Arena, file_id: File.Id) Ast.NodeId 
 fn parseDecl(state: *State) ParseError!Ast.NodeId {
     const identifier = try expect(state, .identifier);
     const str = state.tokens.str(identifier);
-    if (TypeLit.fromStr(str)) |type_lit| {
+    if (Type.fromStr(str)) |type_lit| {
         state.ctx.addMsg(.{
             .severity = .err,
             .pos = .{ .file = state.file_id, .offset = identifier.start },
@@ -310,7 +310,7 @@ fn parseFnType(state: *State) ParseError!Ast.NodeId {
 fn parseFnArg(state: *State) ParseError!Ast.NodeId {
     const identifier = try expect(state, .identifier);
     const str = state.tokens.str(identifier);
-    if (TypeLit.fromStr(str)) |type_lit| {
+    if (Type.fromStr(str)) |type_lit| {
         state.ctx.addMsg(.{
             .severity = .err,
             .pos = .{ .file = state.file_id, .offset = identifier.start },
@@ -468,7 +468,7 @@ fn parseBoolLit(state: *State) Ast.NodeId {
 fn parseIdentifier(state: *State) ParseError!Ast.NodeId {
     const token = try expect(state, .identifier);
     const str = state.tokens.str(token);
-    if (TypeLit.fromStr(str)) |type_lit| {
+    if (Type.fromStr(str)) |type_lit| {
         return state.ast.allocNode(.{
             .pos = token.start,
             .tag = .type_lit,

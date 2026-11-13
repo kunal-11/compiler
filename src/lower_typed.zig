@@ -8,6 +8,7 @@ const File = @import("types.zig").File;
 const Type = @import("types.zig").Type;
 const Func = @import("types.zig").Func;
 const Namespace = @import("types.zig").Namespace;
+const Constant = @import("types.zig").Constant;
 
 const TypedIr = @import("types.zig").TypedIr;
 const UntypedIr = @import("types.zig").UntypedIr;
@@ -108,10 +109,10 @@ pub const State = struct {
     fn ref(lower: *State, val: Value) TypedIr.InstId {
         return switch (val) {
             .known => |value| blk: {
-                const const_id = switch (value.val) {
-                    .undef => lower.ctx.constant_pool.undef(),
+                const const_id: Constant.Id = switch (value.val) {
+                    .undef => .undef,
                     .number => lower.ctx.constant_pool.int(value.val.number),
-                    .boolean => lower.ctx.constant_pool.boolean(value.val.boolean),
+                    .boolean => if (value.val.boolean) .bool_true else .bool_false,
                     else => @panic("emit invalid constant"),
                 };
 
@@ -135,18 +136,13 @@ pub const State = struct {
             .known => |known| {
                 if (known.type == t_id) return val;
 
-                const known_type = state.ctx.type_pool.getType(known.type);
-                const t = state.ctx.type_pool.getType(t_id);
-
-                if (known_type.tag == .lit and t.tag == .lit) {
-                    if (known_type.data.lit == .comp_int) {
-                        // TODO: bounds check
-                        switch (t.data.lit) {
-                            .u8, .u16, .u32, .u64, .usize, .i8, .i16, .i32, .i64, .isize => {
-                                return .{ .known = .{ .type = t_id, .val = known.val } };
-                            },
-                            else => {},
-                        }
+                if (known.type == .comp_int) {
+                    // TODO: bounds check
+                    switch (t_id) {
+                        .u8, .u16, .u32, .u64, .usize, .i8, .i16, .i32, .i64, .isize => {
+                            return .{ .known = .{ .type = t_id, .val = known.val } };
+                        },
+                        else => {},
                     }
                 }
                 return error.IncompatibleTypes;
@@ -160,13 +156,10 @@ pub const State = struct {
     }
 
     fn peerType(state: *State, t1_id: Type.Id, t2_id: Type.Id) !Type.Id {
+        _ = state;
         if (t1_id == t2_id) return t1_id;
-        const t1 = state.ctx.type_pool.getType(t1_id);
-        const t2 = state.ctx.type_pool.getType(t2_id);
-        if (t1.tag == .lit and t2.tag == .lit) {
-            if (t1.data.lit == .comp_int) return t2_id;
-            if (t2.data.lit == .comp_int) return t1_id;
-        }
+        if (t1_id == .comp_int) return t2_id;
+        if (t2_id == .comp_int) return t1_id;
 
         return error.IncompatibleTypes;
     }
@@ -202,17 +195,17 @@ pub fn lowerInst(state: *State, inst_id: UntypedIr.InstId, mode: Mode) Result {
         .num_lit => lowerNumLit(state, inst_id),
 
         .type_lit => .{ .value = .{ .known = .{
-            .type = state.ctx.type_pool.literal(.type_id),
-            .val = .{ .type = state.ctx.type_pool.literal(inst.data.type_lit) },
+            .type = .type_id,
+            .val = .{ .type = inst.data.type_lit },
         } } },
 
         .undef_lit => .{ .value = .{ .known = .{
-            .type = state.ctx.type_pool.literal(.comp_undef),
+            .type = .comp_undef,
             .val = .undef,
         } } },
 
         .bool_lit => .{ .value = .{ .known = .{
-            .type = state.ctx.type_pool.literal(.bool),
+            .type = .bool,
             .val = .{ .boolean = inst.data.bool_lit },
         } } },
 
@@ -221,7 +214,7 @@ pub fn lowerInst(state: *State, inst_id: UntypedIr.InstId, mode: Mode) Result {
                 break :blk .{ .value = .poison };
             };
             break :blk .{ .value = .{ .known = .{
-                .type = state.ctx.type_pool.literal(.type_id),
+                .type = .type_id,
                 .val = .{ .type = state.typeOf(val) },
             } } };
         },
@@ -263,7 +256,7 @@ pub fn lowerInst(state: *State, inst_id: UntypedIr.InstId, mode: Mode) Result {
             .emit => @panic("TODO"),
             .exec => return .{
                 .value = .{ .known = .{
-                    .type = state.ctx.type_pool.literal(.void),
+                    .type = .void,
                     .val = .void,
                 } },
                 .control = .{ .brk = inst.data.unary_op },
@@ -279,7 +272,7 @@ pub fn lowerInst(state: *State, inst_id: UntypedIr.InstId, mode: Mode) Result {
                 const typed_inst = state.emit(.{
                     .pos = inst.pos,
                     .tag = .ret,
-                    .type = state.ctx.type_pool.literal(.noreturn),
+                    .type = .noreturn,
                     .data = .{ .unary_op = .none },
                 });
                 break :blk .{ .value = .{ .runtime = typed_inst } };
@@ -297,7 +290,7 @@ pub fn lowerInst(state: *State, inst_id: UntypedIr.InstId, mode: Mode) Result {
                 const typed_inst = state.emit(.{
                     .pos = inst.pos,
                     .tag = .ret,
-                    .type = state.ctx.type_pool.literal(.noreturn),
+                    .type = .noreturn,
                     .data = .{ .unary_op = val },
                 });
                 break :blk .{ .value = .{ .runtime = typed_inst } };
@@ -328,7 +321,7 @@ fn lowerStore(state: *State, inst_id: UntypedIr.InstId, mode: Mode) Result {
     const addr = state.getOperand(inst.data.bin_op.lhs) orelse return .{ .value = .poison };
     const addr_type_id = state.typeOf(addr);
     const addr_type = state.ctx.type_pool.getType(addr_type_id);
-    if (addr_type.tag != .ptr) {
+    if (addr_type != .ptr) {
         state.ctx.addMsg(.{
             .severity = .err,
             .pos = .{ .file = state.file_id, .offset = inst.pos },
@@ -338,7 +331,7 @@ fn lowerStore(state: *State, inst_id: UntypedIr.InstId, mode: Mode) Result {
     }
 
     const rhs = state.getOperand(inst.data.bin_op.rhs) orelse return .{ .value = .poison };
-    const value = state.coerce(rhs, addr_type.data.ptr) catch {
+    const value = state.coerce(rhs, addr_type.ptr) catch {
         state.ctx.addMsg(.{
             .severity = .err,
             .pos = .{ .file = state.file_id, .offset = inst.pos },
@@ -352,7 +345,7 @@ fn lowerStore(state: *State, inst_id: UntypedIr.InstId, mode: Mode) Result {
             const addr_ref = state.ref(addr);
             const val_ref = state.ref(value);
             const typed_inst = state.emit(.{
-                .type = state.ctx.type_pool.literal(.void),
+                .type = .void,
                 .pos = inst.pos,
                 .tag = .store,
                 .data = .{ .bin_op = .{ .lhs = addr_ref, .rhs = val_ref } },
@@ -368,12 +361,12 @@ fn lowerLoad(state: *State, inst_id: UntypedIr.InstId, mode: Mode) Result {
     const op = state.getOperand(inst.data.unary_op) orelse return .{ .value = .poison };
     const op_type_id = state.typeOf(op);
     const op_type = state.ctx.type_pool.getType(op_type_id);
-    debug.assert(op_type.tag == .ptr, "load must be ptr");
+    debug.assert(op_type == .ptr, "load must be ptr");
     switch (mode) {
         .emit => {
             const addr_ref = state.ref(op);
             const typed_inst = state.emit(.{
-                .type = op_type.data.ptr,
+                .type = op_type.ptr,
                 .pos = inst.pos,
                 .tag = .load,
                 .data = .{ .unary_op = addr_ref },
@@ -395,18 +388,14 @@ fn lowerAlloc(state: *State, inst_id: UntypedIr.InstId, mode: Mode) Result {
         });
         return .{ .value = .poison };
     };
-    const op_type = state.ctx.type_pool.getType(type_id);
-    switch (op_type.tag) {
-        .lit => switch (op_type.data.lit) {
-            .comp_float, .comp_int, .comp_undef => {
-                state.ctx.addMsg(.{
-                    .pos = .{ .file = state.file_id, .offset = inst.pos },
-                    .severity = .err,
-                    .data = .addr_of_comp_type,
-                });
-                return .{ .value = .poison };
-            },
-            else => {},
+    switch (type_id) {
+        .comp_float, .comp_int, .comp_undef => {
+            state.ctx.addMsg(.{
+                .pos = .{ .file = state.file_id, .offset = inst.pos },
+                .severity = .err,
+                .data = .addr_of_comp_type,
+            });
+            return .{ .value = .poison };
         },
         else => {},
     }
@@ -559,7 +548,7 @@ fn lowerNumLit(state: *State, inst_id: UntypedIr.InstId) Result {
     const num_str = file.contents[num_token.start..num_token.end];
     const num = math.parseInt(i64, num_str) catch @panic("TODO: handle invalid num");
     return .{ .value = .{ .known = .{
-        .type = state.ctx.type_pool.literal(.comp_int),
+        .type = .comp_int,
         .val = .{ .number = num },
     } } };
 }
@@ -594,7 +583,7 @@ fn lowerFnType(state: *State, inst_id: UntypedIr.InstId) Result {
         };
     }
     return .{ .value = .{ .known = .{
-        .type = state.ctx.type_pool.literal(.type_id),
+        .type = .type_id,
         .val = .{ .type = state.ctx.type_pool.func(ret, args) },
     } } };
 }

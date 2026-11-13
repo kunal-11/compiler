@@ -26,20 +26,20 @@ pub fn debugPrintType(pool: *Type.Pool, id: Type.Id) void {
         return;
     }
     const t = pool.getType(id);
-    switch (t.tag) {
-        .lit => debug.print("{s}", .{@tagName(t.data.lit)}),
+    switch (t) {
+        .lit => debug.print("{s}", .{@tagName(id)}),
         .ptr => {
             debug.print("*", .{});
-            debugPrintType(pool, t.data.ptr);
+            debugPrintType(pool, t.ptr);
         },
         .func => {
             debug.print("fn (", .{});
-            for (0..t.data.func.args.count) |i| {
-                const arg_id = pool.extras[t.data.func.args.offset + i];
+            for (0..t.func.args.count) |i| {
+                const arg_id = pool.extras[t.func.args.offset + i];
                 debugPrintType(pool, arg_id);
             }
             debug.print(") ", .{});
-            debugPrintType(pool, t.data.func.ret);
+            debugPrintType(pool, t.func.ret);
         },
     }
 }

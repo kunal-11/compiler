@@ -24,7 +24,7 @@ pub const Message = struct {
         expected_expression,
         expected_type,
         expected_lvalue,
-        name_shadows_type: TypeLit,
+        name_shadows_type: Type.Id,
 
         exptected_ptr,
         addr_of_comp_type,
@@ -99,8 +99,8 @@ pub const Context = struct {
     symbol_table: Symbol.Table = .{},
     func_table: Func.Table = .{},
 
-    type_pool: Type.Pool = .{},
-    constant_pool: Constant.Pool = .{},
+    type_pool: Type.Pool,
+    constant_pool: Constant.Pool,
 
     analysis_q: analyzer.Queue = .{},
 
@@ -271,7 +271,7 @@ pub const Ast = struct {
 
             identifier: struct { intern_id: InternPool.Id },
 
-            type_lit: TypeLit,
+            type_lit: Type.Id,
             bool_lit: bool,
 
             fn_type: struct { args: NodeId, return_type: NodeId },
@@ -374,7 +374,7 @@ pub const UntypedIr = struct {
             empty: void,
             block: List,
 
-            type_lit: TypeLit,
+            type_lit: Type.Id,
             bool_lit: bool,
 
             global_ref: InternPool.Id,
@@ -497,33 +497,41 @@ pub const TypedIr = struct {
     }
 };
 
-pub const TypeLit = enum(u32) {
-    u8,
-    u16,
-    u32,
-    u64,
-    usize,
+pub const Type = union(enum) {
+    pub const Id = enum(u32) {
+        none = 0,
 
-    i8,
-    i16,
-    i32,
-    i64,
-    isize,
+        u8,
+        u16,
+        u32,
+        u64,
+        usize,
 
-    f32,
-    f64,
+        i8,
+        i16,
+        i32,
+        i64,
+        isize,
 
-    comp_int,
-    comp_float,
-    comp_undef,
+        f32,
+        f64,
 
-    bool,
-    void,
-    noreturn,
+        comp_int,
+        comp_float,
+        comp_undef,
 
-    type_id,
+        bool,
+        void,
+        noreturn,
 
-    pub fn fromStr(str: []const u8) ?TypeLit {
+        type_id,
+
+        _,
+
+        const len = @typeInfo(Id).@"enum".field_names.len;
+    };
+
+    pub fn fromStr(str: []const u8) ?Id {
         return if (mem.eql(str, "u8"))
             .u8
         else if (mem.eql(str, "u16"))
@@ -563,23 +571,12 @@ pub const TypeLit = enum(u32) {
         else
             null;
     }
-};
 
-pub const Type = struct {
-    pub const Id = enum(u32) { none = 0, _ };
+    pub const Tag = @typeInfo(@This()).@"union".tag_type orelse unreachable;
 
-    pub const Tag = enum(u32) {
-        lit,
-        func,
-        ptr,
-    };
-
-    tag: Tag,
-    data: union {
-        lit: TypeLit,
-        func: struct { ret: Id, args: List },
-        ptr: Id,
-    },
+    lit,
+    func: struct { ret: Id, args: List },
+    ptr: Id,
 
     // TODO: this is not good for lookup, even duplicate lookup need to allocate lists
     pub const List = struct {
@@ -595,54 +592,61 @@ pub const Type = struct {
         buckets: [max_buckets]Id = @splat(.none),
         next: [max_types]Id = @splat(.none),
 
-        types: [max_types]Type = undefined,
-        next_id: u32 = 1,
+        types: [max_types]Type,
+        next_id: u32 = Id.len,
 
         extras: [max_extras]Id = undefined,
         extra_count: u32 = 0,
 
+        pub fn init(pool: *Pool) void {
+            pool.* = .{ .types = undefined };
+            for (1..Id.len) |res_id| {
+                pool.types[res_id] = .lit;
+            }
+        }
+
         fn hash(pool: *Pool, t: Type) u64 {
             var fnv = math.Fnv{};
-            fnv.roll32(@backingInt(t.tag));
-            switch (t.tag) {
-                .lit => fnv.roll32(@backingInt(t.data.lit)),
+            fnv.roll32(@backingInt(t));
+            switch (t) {
+                .lit => @panic("lits not hashable"),
                 .func => {
-                    fnv.roll32(@backingInt(t.data.func.ret));
-                    for (0..t.data.func.args.count) |i| {
-                        fnv.roll32(@backingInt(pool.extras[t.data.func.args.offset + i]));
+                    fnv.roll32(@backingInt(t.func.ret));
+                    for (0..t.func.args.count) |i| {
+                        fnv.roll32(@backingInt(pool.extras[t.func.args.offset + i]));
                     }
                 },
-                .ptr => fnv.roll32(@backingInt(t.data.ptr)),
+                .ptr => fnv.roll32(@backingInt(t.ptr)),
             }
             return fnv.hash;
         }
 
         fn eql(pool: *Pool, t1: Type, t2: Type) bool {
-            if (t1.tag != t2.tag) return false;
-            return switch (t1.tag) {
-                .lit => t1.data.lit == t2.data.lit,
-                .ptr => t1.data.ptr == t2.data.ptr,
+            if (@as(Tag, t1) != @as(Tag, t2)) return false;
+            return switch (t1) {
+                .lit => @panic("lits not comparable"),
+                .ptr => t1.ptr == t2.ptr,
                 .func => blk: {
-                    if (t1.data.func.ret != t2.data.func.ret or
-                        t1.data.func.args.count != t2.data.func.args.count)
+                    if (t1.func.ret != t2.func.ret or
+                        t1.func.args.count != t2.func.args.count)
                     {
                         break :blk false;
                     }
 
-                    for (0..t1.data.func.args.count) |arg_i| {
-                        const a1 = pool.extras[t1.data.func.args.offset + arg_i];
-                        const a2 = pool.extras[t2.data.func.args.offset + arg_i];
+                    for (0..t1.func.args.count) |arg_i| {
+                        const a1 = pool.extras[t1.func.args.offset + arg_i];
+                        const a2 = pool.extras[t2.func.args.offset + arg_i];
                         if (a1 != a2) {
                             break :blk false;
                         }
                     }
-
                     break :blk true;
                 },
             };
         }
 
         fn getOrCreateId(pool: *Pool, t: Type, extra_marker: u32) Id {
+            debug.assert(t != .lit, "cannot create a literal type");
             var slot = &pool.buckets[pool.hash(t) % max_buckets];
             while (slot.* != .none) : (slot = &pool.next[@backingInt(slot.*)]) {
                 if (pool.eql(pool.types[@backingInt(slot.*)], t)) break;
@@ -670,27 +674,17 @@ pub const Type = struct {
             };
         }
 
-        pub fn literal(pool: *Pool, l: TypeLit) Id {
-            return pool.getOrCreateId(.{
-                .tag = .lit,
-                .data = .{ .lit = l },
-            }, pool.extra_count);
-        }
-
         pub fn ptr(pool: *Pool, t: Id) Id {
-            return pool.getOrCreateId(.{
-                .tag = .ptr,
-                .data = .{ .ptr = t },
-            }, pool.extra_count);
+            return pool.getOrCreateId(.{ .ptr = t }, pool.extra_count);
         }
 
         pub fn func(pool: *Pool, ret: Id, args: []Id) Id {
             const marker = pool.extra_count;
             const args_list = pool.allocList(args);
-            return pool.getOrCreateId(.{
-                .tag = .func,
-                .data = .{ .func = .{ .args = args_list, .ret = ret } },
-            }, marker);
+            return pool.getOrCreateId(.{ .func = .{
+                .args = args_list,
+                .ret = ret,
+            } }, marker);
         }
 
         pub fn getType(pool: *Pool, id: Id) Type {
@@ -701,9 +695,18 @@ pub const Type = struct {
 };
 
 pub const Constant = union(enum) {
-    pub const Id = enum(u32) { none = 0, _ };
+    pub const Id = enum(u32) {
+        none = 0,
 
-    pub const Tag = enum { int, float, bool, undef };
+        undef,
+
+        bool_true,
+        bool_false,
+
+        _,
+
+        const len = @typeInfo(@This()).@"enum".field_names.len;
+    };
 
     undef,
     bool: bool,
@@ -742,8 +745,15 @@ pub const Constant = union(enum) {
         buckets: [max_buckets]Id = @splat(.none),
         next: [max_constants]Id = @splat(.none),
 
-        constants: [max_constants]Constant = undefined,
-        next_id: u32 = 1,
+        constants: [max_constants]Constant,
+        next_id: u32 = Id.len,
+
+        pub fn init(pool: *Pool) void {
+            pool.* = .{ .constants = undefined };
+            pool.constants[@backingInt(Id.undef)] = .undef;
+            pool.constants[@backingInt(Id.bool_true)] = .{ .bool = true };
+            pool.constants[@backingInt(Id.bool_false)] = .{ .bool = false };
+        }
 
         fn getOrCreateId(pool: *Pool, c: Constant) Id {
             var slot = &pool.buckets[c.hash() % max_buckets];
@@ -757,14 +767,6 @@ pub const Constant = union(enum) {
                 pool.constants[@backingInt(slot.*)] = c;
             }
             return slot.*;
-        }
-
-        pub fn undef(pool: *Pool) Id {
-            return pool.getOrCreateId(.undef);
-        }
-
-        pub fn boolean(pool: *Pool, b: bool) Id {
-            return pool.getOrCreateId(.{ .bool = b });
         }
 
         pub fn int(pool: *Pool, v: i64) Id {

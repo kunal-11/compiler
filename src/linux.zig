@@ -28,7 +28,9 @@ pub fn main() !void {
     var arena = mem.Arena{ .memory = bytes };
 
     const ctx = arena.pushStruct(Context);
-    ctx.* = .{};
+    ctx.* = .{ .type_pool = undefined, .constant_pool = undefined };
+    ctx.type_pool.init();
+    ctx.constant_pool.init();
 
     const global_ns_id = ctx.addNamespace(&arena);
     _ = try loadFile(ctx, &arena, global_ns_id, test_file);
