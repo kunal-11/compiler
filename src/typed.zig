@@ -15,6 +15,101 @@ const Symbol = @import("types.zig").Symbol;
 const UntypedIr = @import("untyped.zig").Ir;
 const lexer = @import("lexer.zig");
 
+pub const Queue = struct {
+    pub const Item = union(enum) {
+        empty,
+        decl: Symbol.Id,
+        fn_lit: Func.Id,
+    };
+
+    const len = 1024;
+
+    items: [len]Item = undefined,
+    read: u32 = 0,
+    write: u32 = 1,
+
+    pub fn push(q: *Queue, item: Item) void {
+        debug.assert((q.write + 1) % len != q.read, "analysis queue OOM");
+        q.items[q.write] = item;
+        q.write = (q.write + 1) % len;
+    }
+
+    pub fn pop(q: *Queue) Item {
+        if ((q.read + 1) % len == q.write) return .empty;
+        q.read = (q.read + 1) % len;
+        return q.items[q.read];
+    }
+};
+
+pub fn analyze(ctx: *Context, arena: *mem.Arena) void {
+    const flusher = mem.Flusher.init(arena);
+    defer flusher.flush();
+
+    var item = ctx.analysis_q.pop();
+    while (item != .empty) : (item = ctx.analysis_q.pop()) {
+        switch (item) {
+            .decl => |decl| {
+                const value = resolveSymbol(ctx, arena, decl) orelse continue;
+                switch (value.val) {
+                    .fn_lit => |fn_lit| {
+                        const func = ctx.func_table.get(fn_lit);
+                        if (func.status == .unchecked) {
+                            ctx.analysis_q.push(.{ .fn_lit = fn_lit });
+                            func.status = .queued;
+                        }
+                    },
+                    else => {},
+                }
+            },
+            .fn_lit => |lit| {
+                const func = ctx.func_table.get(lit);
+                debug.assert(func.status == .queued, "fn check item invalid status");
+
+                const res = lowerInst(func.eval_state, func.untyped_inst, .emit);
+                debug.assert(res.control == .none, "jump on emit mode lower");
+                switch (res.value) {
+                    .none, .known => @panic("invalid value for checked fn lit"),
+                    .poison => func.status = .failed,
+                    .runtime => |inst| func.status = .{ .checked = inst },
+                }
+            },
+            .empty => unreachable,
+        }
+    }
+}
+
+fn resolveSymbol(ctx: *Context, arena: *mem.Arena, id: Symbol.Id) ?Known {
+    const symbol = ctx.symbol_table.get(id);
+    switch (symbol.status) {
+        .unchecked => {
+            symbol.status = .in_progress;
+            const state = State.init(ctx, symbol.file, arena);
+            const res = lowerInst(state, symbol.value, .exec);
+            debug.assert(res.control == .none, "global block must break to itself");
+            const value = switch (res.value) {
+                .poison => {
+                    symbol.status = .failed;
+                    return null;
+                },
+                .known => |val| val,
+                .none, .runtime => @panic("symbol resolved to invalid value"),
+            };
+            symbol.status = .{ .checked = value };
+            return value;
+        },
+        .in_progress => {
+            ctx.addMsg(.{
+                .severity = .err,
+                .pos = .{ .file = symbol.file, .offset = symbol.pos },
+                .data = .eval_cycle_detected,
+            });
+            return null;
+        },
+        .checked => |val| return val,
+        .failed => return null,
+    }
+}
+
 pub const Ir = struct {
     pub const Tag = enum(u32) {
         constant,
@@ -227,7 +322,7 @@ pub const State = struct {
                 const t = state.ctx.type_pool.getType(t_id);
                 switch (known.type) {
                     .comp_int => {
-                        if (t == .fixed_int) {
+                        if (t == .fixed_int or t_id == .usize or t_id == .isize) {
                             return .{ .known = .{ .type = t_id, .val = known.val } };
                         }
                     },
@@ -253,19 +348,16 @@ pub const State = struct {
     }
 };
 
-pub fn evalBlock(
-    ctx: *Context,
-    arena: *mem.Arena,
-    file_id: File.Id,
-    inst_id: UntypedIr.InstId,
-) *State {
-    const state = State.init(ctx, file_id, arena);
-    const res = lowerInst(state, inst_id, .exec);
-    debug.assert(res.control == .none, "global block must break to itself");
-    return state;
-}
+pub const Mode = enum { emit, exec };
 
-const Mode = enum { emit, exec };
+pub const Result = struct {
+    value: Value,
+    control: union(enum) {
+        none,
+        ret,
+        brk: UntypedIr.InstId,
+    } = .none,
+};
 
 pub fn lowerInst(state: *State, inst_id: UntypedIr.InstId, mode: Mode) Result {
     const inst = state.untyped_ir.getInst(inst_id);
@@ -364,19 +456,14 @@ pub fn lowerInst(state: *State, inst_id: UntypedIr.InstId, mode: Mode) Result {
                     .val = .{ .type = t },
                 } } },
                 .symbol => |symbol_id| {
-                    // TODO: emit a load and error in exec in case of variable
-
-                    // TODO: check if already evaled and reuse value
-                    const symbol = state.ctx.symbol_table.get(symbol_id);
-                    const child_state = evalBlock(
-                        state.ctx,
-                        state.arena,
-                        symbol.file,
-                        symbol.value_inst,
-                    );
-                    const child_value = child_state.getOperand(symbol.value_inst) orelse
+                    const value = resolveSymbol(state.ctx, state.arena, symbol_id) orelse {
                         break :blk .{ .value = .poison };
-                    break :blk .{ .value = child_value };
+                    };
+                    const symbol = state.ctx.symbol_table.get(symbol_id);
+                    break :blk switch (symbol.tag) {
+                        .variable => @panic("TODO"),
+                        .constant => .{ .value = .{ .known = value } },
+                    };
                 },
             }
         },
@@ -419,15 +506,6 @@ pub fn lowerInst(state: *State, inst_id: UntypedIr.InstId, mode: Mode) Result {
     // debug.log("%{} = {}", .{ @backingInt(inst_id), res.value });
     return res;
 }
-
-const Result = struct {
-    value: Value,
-    control: union(enum) {
-        none,
-        ret,
-        brk: UntypedIr.InstId,
-    } = .none,
-};
 
 fn lowerStore(state: *State, inst_id: UntypedIr.InstId, mode: Mode) Result {
     const inst = state.untyped_ir.getInst(inst_id);
@@ -644,6 +722,7 @@ fn lowerFnLit(state: *State, inst_id: UntypedIr.InstId, mode: Mode) Result {
                 .file = state.file_id,
                 .type = type_res.known.val.type,
                 .untyped_inst = inst_id,
+                .eval_state = state, // TODO: copy this state, it may be modified later
                 .status = .unchecked,
             });
             return .{ .value = .{ .known = .{

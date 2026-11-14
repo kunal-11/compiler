@@ -16,7 +16,6 @@ const parser = @import("parser.zig");
 const untyped = @import("untyped.zig");
 const typed = @import("typed.zig");
 const printer = @import("printer.zig");
-const analyzer = @import("analyzer.zig");
 
 const roots = [_][]const u8{"main"};
 
@@ -33,12 +32,12 @@ pub fn main() !void {
     const global_ns_id = ctx.addNamespace(&arena);
     _ = try loadFile(ctx, &arena, global_ns_id, test_file);
 
-    analyzer.analyze(ctx, &arena);
+    typed.analyze(ctx, &arena);
 
     for (ctx.func_table.funcs[1..ctx.func_table.next_id]) |f| {
         const file = ctx.getFile(f.file);
         switch (f.status) {
-            .unchecked => {},
+            .unchecked, .failed => {},
             .queued => @panic("queued func left after analysis"),
             .checked => |inst| {
                 printer.debugPrintTypedIr(ctx, file.typed_ir, inst, 0);
@@ -106,7 +105,7 @@ fn loadFile(ctx: *Context, arena: *mem.Arena, ns_id: Namespace.Id, path: []const
                 .var_decl => .variable,
             },
             .pos = decl.pos,
-            .value_inst = decl.value,
+            .value = decl.value,
             .status = .unchecked,
         });
 

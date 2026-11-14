@@ -5,10 +5,64 @@ const debug = stdx.debug;
 
 const lexer = @import("lexer.zig");
 const Ast = @import("parser.zig").Ast;
-const analyzer = @import("analyzer.zig");
 
 const untyped = @import("untyped.zig");
 const typed = @import("typed.zig");
+
+pub const Context = struct {
+    const max_messages = 2048;
+    const max_files = 2048;
+    const max_namespaces = 1024;
+
+    intern_pool: InternPool = .{},
+
+    files: [max_files]File = undefined,
+    file_count: u32 = 1,
+
+    namespaces: [max_namespaces]Namespace = undefined,
+    namespace_count: u32 = 1,
+
+    msgs: [max_messages]Message = undefined,
+    msg_count: u32 = 0,
+
+    symbol_table: Symbol.Table = .{},
+    func_table: Func.Table = .{},
+
+    type_pool: Type.Pool,
+    constant_pool: Constant.Pool,
+
+    analysis_q: typed.Queue = .{},
+
+    pub fn addMsg(ctx: *Context, msg: Message) void {
+        ctx.msgs[ctx.msg_count] = msg;
+        ctx.msg_count += 1;
+    }
+
+    pub fn addFile(ctx: *Context, file: File) File.Id {
+        const result = ctx.file_count;
+        ctx.file_count += 1;
+        ctx.files[result] = file;
+        return @fromBackingInt(result);
+    }
+
+    pub fn getFile(ctx: *Context, file_id: File.Id) *File {
+        debug.assert(file_id != .none, "get none file");
+        return &ctx.files[@backingInt(file_id)];
+    }
+
+    const namespace_size = 8 * mem.KB;
+    pub fn addNamespace(ctx: *Context, arena: *mem.Arena) Namespace.Id {
+        const result = ctx.namespace_count;
+        ctx.namespace_count += 1;
+        ctx.namespaces[result] = .{ .arena = arena.subArena(namespace_size) };
+        return @fromBackingInt(result);
+    }
+
+    pub fn getNamespace(ctx: *Context, ns_id: Namespace.Id) *Namespace {
+        debug.assert(ns_id != .none, "get none file");
+        return &ctx.namespaces[@backingInt(ns_id)];
+    }
+};
 
 pub const Message = struct {
     pub const Severity = enum { info, warn, err };
@@ -39,6 +93,7 @@ pub const Message = struct {
         closure_on_variable: struct {
             original_pos: Position,
         },
+        eval_cycle_detected,
     },
 };
 
@@ -77,61 +132,6 @@ pub const InternPool = struct {
         var result: math.Fnv = .{};
         result.roll(str);
         return result.hash;
-    }
-};
-
-pub const Context = struct {
-    const max_messages = 2048;
-    const max_files = 2048;
-    const max_namespaces = 1024;
-
-    intern_pool: InternPool = .{},
-
-    files: [max_files]File = undefined,
-    file_count: u32 = 1,
-
-    namespaces: [max_namespaces]Namespace = undefined,
-    namespace_count: u32 = 1,
-
-    msgs: [max_messages]Message = undefined,
-    msg_count: u32 = 0,
-
-    symbol_table: Symbol.Table = .{},
-    func_table: Func.Table = .{},
-
-    type_pool: Type.Pool,
-    constant_pool: Constant.Pool,
-
-    analysis_q: analyzer.Queue = .{},
-
-    pub fn addMsg(ctx: *Context, msg: Message) void {
-        ctx.msgs[ctx.msg_count] = msg;
-        ctx.msg_count += 1;
-    }
-
-    pub fn addFile(ctx: *Context, file: File) File.Id {
-        const result = ctx.file_count;
-        ctx.file_count += 1;
-        ctx.files[result] = file;
-        return @fromBackingInt(result);
-    }
-
-    pub fn getFile(ctx: *Context, file_id: File.Id) *File {
-        debug.assert(file_id != .none, "get none file");
-        return &ctx.files[@backingInt(file_id)];
-    }
-
-    const namespace_size = 8 * mem.KB;
-    pub fn addNamespace(ctx: *Context, arena: *mem.Arena) Namespace.Id {
-        const result = ctx.namespace_count;
-        ctx.namespace_count += 1;
-        ctx.namespaces[result] = .{ .arena = arena.subArena(namespace_size) };
-        return @fromBackingInt(result);
-    }
-
-    pub fn getNamespace(ctx: *Context, ns_id: Namespace.Id) *Namespace {
-        debug.assert(ns_id != .none, "get none file");
-        return &ctx.namespaces[@backingInt(ns_id)];
     }
 };
 
@@ -208,7 +208,7 @@ pub const Symbol = struct {
         next_id: u32 = 1,
 
         pub fn add(table: *Table, symbol: Symbol) Id {
-            debug.assert(symbol.value_inst != .none, "symbol value cannot be none");
+            debug.assert(symbol.value != .none, "symbol value cannot be none");
             const result = table.next_id;
             table.next_id += 1;
             table.symbols[result] = symbol;
@@ -223,10 +223,15 @@ pub const Symbol = struct {
 
     file: File.Id,
     pos: u32,
-    value_inst: untyped.Ir.InstId,
+    value: untyped.Ir.InstId,
 
     tag: enum { variable, constant },
-    status: enum { unchecked, checked, check_failed },
+    status: union(enum) {
+        unchecked,
+        in_progress,
+        failed,
+        checked: typed.Known,
+    },
 };
 
 pub const Type = union(enum) {
@@ -532,9 +537,12 @@ pub const Func = struct {
     type: Type.Id,
     file: File.Id,
     untyped_inst: untyped.Ir.InstId,
+    eval_state: *typed.State,
+
     status: union(enum) {
         unchecked,
-        queued: *typed.State,
+        queued,
+        failed,
         checked: typed.Ir.InstId,
     },
 
