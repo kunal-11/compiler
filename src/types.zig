@@ -24,8 +24,8 @@ pub const Message = struct {
         expected_expression,
         expected_type,
         expected_lvalue,
-        name_shadows_type: Type.Id,
 
+        undeclared_identifier,
         exptected_ptr,
         addr_of_comp_type,
         incompatible_peer_types,
@@ -238,7 +238,6 @@ pub const Ast = struct {
         bool_lit,
         undef_lit,
         num_lit,
-        type_lit,
 
         fn_type,
         fn_lit,
@@ -271,7 +270,6 @@ pub const Ast = struct {
 
             identifier: struct { intern_id: InternPool.Id },
 
-            type_lit: Type.Id,
             bool_lit: bool,
 
             fn_type: struct { args: NodeId, return_type: NodeId },
@@ -332,7 +330,7 @@ pub const UntypedIr = struct {
         brk_implicit, // unary_op - block_id
 
         ret, // unary_op - value
-        ret_implicit, // unary_op - fn_lit id
+        ret_implicit, // empty
 
         coerce_type, // lhs - type inst, rhs - value
         type_of,
@@ -340,7 +338,6 @@ pub const UntypedIr = struct {
         global_ptr,
         global_val,
 
-        type_lit,
         num_lit,
         bool_lit,
         undef_lit,
@@ -374,7 +371,6 @@ pub const UntypedIr = struct {
             empty: void,
             block: List,
 
-            type_lit: Type.Id,
             bool_lit: bool,
 
             global_ref: InternPool.Id,
@@ -501,24 +497,12 @@ pub const Type = union(enum) {
     pub const Id = enum(u32) {
         none = 0,
 
-        u8,
-        u16,
-        u32,
-        u64,
-        usize,
-
-        i8,
-        i16,
-        i32,
-        i64,
-        isize,
-
-        f32,
-        f64,
-
+        comp_undef,
         comp_int,
         comp_float,
-        comp_undef,
+
+        isize,
+        usize,
 
         bool,
         void,
@@ -531,54 +515,16 @@ pub const Type = union(enum) {
         const len = @typeInfo(Id).@"enum".field_names.len;
     };
 
-    pub fn fromStr(str: []const u8) ?Id {
-        return if (mem.eql(str, "u8"))
-            .u8
-        else if (mem.eql(str, "u16"))
-            .u16
-        else if (mem.eql(str, "u32"))
-            .u32
-        else if (mem.eql(str, "u64"))
-            .u64
-        else if (mem.eql(str, "usize"))
-            .usize
-        else if (mem.eql(str, "i8"))
-            .i8
-        else if (mem.eql(str, "i16"))
-            .i16
-        else if (mem.eql(str, "i32"))
-            .i32
-        else if (mem.eql(str, "i64"))
-            .i64
-        else if (mem.eql(str, "isize"))
-            .isize
-        else if (mem.eql(str, "f32"))
-            .f32
-        else if (mem.eql(str, "f64"))
-            .f64
-        else if (mem.eql(str, "comp_int"))
-            .comp_int
-        else if (mem.eql(str, "comp_float"))
-            .comp_float
-        else if (mem.eql(str, "bool"))
-            .bool
-        else if (mem.eql(str, "void"))
-            .void
-        else if (mem.eql(str, "noreturn"))
-            .noreturn
-        else if (mem.eql(str, "type_id"))
-            .type_id
-        else
-            null;
-    }
-
     pub const Tag = @typeInfo(@This()).@"union".tag_type orelse unreachable;
 
-    lit,
+    const Float = enum(u8) { single, double };
+
+    lit: Id,
+    fixed_int: struct { signed: bool, width: u16 },
+    float: Float,
     func: struct { ret: Id, args: List },
     ptr: Id,
 
-    // TODO: this is not good for lookup, even duplicate lookup need to allocate lists
     pub const List = struct {
         offset: u32,
         count: u32,
@@ -600,8 +546,8 @@ pub const Type = union(enum) {
 
         pub fn init(pool: *Pool) void {
             pool.* = .{ .types = undefined };
-            for (1..Id.len) |res_id| {
-                pool.types[res_id] = .lit;
+            for (1..Id.len) |id| {
+                pool.types[id] = .{ .lit = @fromBackingInt(@intCast(id)) };
             }
         }
 
@@ -610,13 +556,18 @@ pub const Type = union(enum) {
             fnv.roll32(@backingInt(t));
             switch (t) {
                 .lit => @panic("lits not hashable"),
-                .func => {
-                    fnv.roll32(@backingInt(t.func.ret));
-                    for (0..t.func.args.count) |i| {
-                        fnv.roll32(@backingInt(pool.extras[t.func.args.offset + i]));
+                .fixed_int => |i| {
+                    if (i.signed) fnv.roll(&.{23}) else fnv.roll(&.{17});
+                    fnv.roll(@ptrCast(&i.width));
+                },
+                .float => |f| fnv.roll(@ptrCast(&f)),
+                .ptr => |p| fnv.roll32(@backingInt(p)),
+                .func => |f| {
+                    fnv.roll32(@backingInt(f.ret));
+                    for (0..f.args.count) |i| {
+                        fnv.roll32(@backingInt(pool.extras[f.args.offset + i]));
                     }
                 },
-                .ptr => fnv.roll32(@backingInt(t.ptr)),
             }
             return fnv.hash;
         }
@@ -624,7 +575,10 @@ pub const Type = union(enum) {
         fn eql(pool: *Pool, t1: Type, t2: Type) bool {
             if (@as(Tag, t1) != @as(Tag, t2)) return false;
             return switch (t1) {
-                .lit => @panic("lits not comparable"),
+                .lit => t1.lit == t2.lit,
+                .fixed_int => t1.fixed_int.signed == t2.fixed_int.signed and
+                    t1.fixed_int.width == t2.fixed_int.width,
+                .float => t1.float == t2.float,
                 .ptr => t1.ptr == t2.ptr,
                 .func => blk: {
                     if (t1.func.ret != t2.func.ret or
@@ -687,9 +641,61 @@ pub const Type = union(enum) {
             } }, marker);
         }
 
+        pub fn int(pool: *Pool, signed: bool, width: u16) Id {
+            return pool.getOrCreateId(.{ .fixed_int = .{
+                .signed = signed,
+                .width = width,
+            } }, pool.extra_count);
+        }
+
+        pub fn float(pool: *Pool, val: Float) Id {
+            return pool.getOrCreateId(.{ .float = val }, pool.extra_count);
+        }
+
         pub fn getType(pool: *Pool, id: Id) Type {
             debug.assert(id != .none, "type get none");
             return pool.types[@backingInt(id)];
+        }
+
+        pub fn parseLiteral(pool: *Pool, str: []const u8) Type.Id {
+            if (mem.eql(str, "bool"))
+                return .bool
+            else if (mem.eql(str, "void"))
+                return .void
+            else if (mem.eql(str, "noreturn"))
+                return .noreturn
+            else if (mem.eql(str, "type_id"))
+                return .type_id
+            else if (mem.eql(str, "comp_float"))
+                return .comp_float
+            else if (mem.eql(str, "comp_int"))
+                return .comp_int
+            else if (mem.eql(str, "usize"))
+                return .usize
+            else if (mem.eql(str, "isize"))
+                return .isize
+            else if (mem.eql(str, "f32"))
+                return pool.float(.single)
+            else if (mem.eql(str, "f64"))
+                return pool.float(.double)
+            else if (mem.eql(str, "u8"))
+                return pool.int(false, 8)
+            else if (mem.eql(str, "u16"))
+                return pool.int(false, 16)
+            else if (mem.eql(str, "u32"))
+                return pool.int(false, 32)
+            else if (mem.eql(str, "u64"))
+                return pool.int(false, 64)
+            else if (mem.eql(str, "i8"))
+                return pool.int(true, 8)
+            else if (mem.eql(str, "i16"))
+                return pool.int(true, 16)
+            else if (mem.eql(str, "i32"))
+                return pool.int(true, 32)
+            else if (mem.eql(str, "i64"))
+                return pool.int(true, 64)
+            else
+                return .none;
         }
     };
 };

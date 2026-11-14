@@ -28,9 +28,17 @@ pub fn debugPrintType(pool: *Type.Pool, id: Type.Id) void {
     const t = pool.getType(id);
     switch (t) {
         .lit => debug.print("{s}", .{@tagName(id)}),
-        .ptr => {
+        .fixed_int => |int| {
+            const prefix = if (int.signed) "i" else "u";
+            debug.print("{s}{}", .{ prefix, int.width });
+        },
+        .float => |f| switch (f) {
+            .single => debug.print("f32", .{}),
+            .double => debug.print("f64", .{}),
+        },
+        .ptr => |ptr| {
             debug.print("*", .{});
-            debugPrintType(pool, t.ptr);
+            debugPrintType(pool, ptr);
         },
         .func => {
             debug.print("fn (", .{});
@@ -166,7 +174,7 @@ pub fn debugPrintIr(
             });
         },
 
-        .num_lit, .type_lit, .bool_lit, .undef_lit, .reserved, .global_val, .global_ptr => {
+        .num_lit, .bool_lit, .undef_lit, .reserved, .global_val, .global_ptr => {
             const token = lexer.lexToken(file, inst.pos);
             const str = file[token.start..token.end];
             debug.print("%{} = {s} #{s}\n", .{ @backingInt(inst_id), @tagName(inst.tag), str });
@@ -252,6 +260,6 @@ pub fn debugPrintAst(
             debugPrintAst(file, ast, node.data.bin_op.rhs, child_len, true);
         },
 
-        .identifier, .type_lit, .bool_lit, .undef_lit, .num_lit => {},
+        .identifier, .bool_lit, .undef_lit, .num_lit => {},
     }
 }

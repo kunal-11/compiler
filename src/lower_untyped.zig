@@ -7,6 +7,7 @@ const Ast = @import("types.zig").Ast;
 const File = @import("types.zig").File;
 const Ir = @import("types.zig").UntypedIr;
 const InternPool = @import("types.zig").InternPool;
+const Type = @import("types.zig").Type;
 
 const State = struct {
     const max_instructions = 4096;
@@ -30,6 +31,7 @@ const State = struct {
     ir: *Ir,
 
     file_id: File.Id,
+    name_table: NameTable = .{},
 
     insts: [max_instructions]Ir.InstId = undefined,
     inst_count: u32 = 0,
@@ -39,8 +41,6 @@ const State = struct {
 
     phases: [max_blocks]Phase = undefined,
     phase_count: u32 = 0,
-
-    name_table: NameTable = .{},
 
     pub fn emit(state: *State, inst: Ir.Inst) Ir.InstId {
         const inst_id = state.ir.allocInst(inst);
@@ -247,8 +247,8 @@ const NameTable = struct {
     pub fn addName(table: *NameTable, name: Name) AddResult {
         const slot = table.getSlot(name.intern_id);
 
-        // shadowing rule
-        if (slot.name.intern_id != .none) {
+        // shadowing rule -- same lexical depth not allowed
+        if (slot.name.intern_id != .none and slot.lexical_depth == table.lexical_depth) {
             return .{ .redeclared = slot.name };
         }
 
@@ -331,6 +331,7 @@ pub fn lowerFile(ctx: *Context, arena: *mem.Arena, file_id: File.Id, root_id: As
         .ast = file.ast,
         .ir = file.untyped_ir,
         .file_id = file_id,
+        .name_table = .{},
     };
 
     const node = state.ast.getNode(root_id);
@@ -453,11 +454,6 @@ fn lower(state: *State, node_id: Ast.NodeId, res_type: Ir.InstId) Ir.InstId {
             .tag = .bool_lit,
             .data = .{ .bool_lit = node.data.bool_lit },
         }),
-        .type_lit => state.emit(.{
-            .pos = node.pos,
-            .tag = .type_lit,
-            .data = .{ .type_lit = node.data.type_lit },
-        }),
 
         .fn_lit => blk: {
             state.beginCompileBlock();
@@ -558,10 +554,7 @@ fn lower(state: *State, node_id: Ast.NodeId, res_type: Ir.InstId) Ir.InstId {
             switch (state.name_table.addName(name)) {
                 .redeclared => |og_name| {
                     state.ctx.addMsg(.{
-                        .pos = .{
-                            .file = state.file_id,
-                            .offset = param.pos,
-                        },
+                        .pos = .{ .file = state.file_id, .offset = param.pos },
                         .severity = .err,
                         .data = .{ .duplicate_decl = .{
                             .original_pos = .{
@@ -611,10 +604,7 @@ fn lower(state: *State, node_id: Ast.NodeId, res_type: Ir.InstId) Ir.InstId {
             switch (state.name_table.addName(name)) {
                 .redeclared => |og_name| {
                     state.ctx.addMsg(.{
-                        .pos = .{
-                            .file = state.file_id,
-                            .offset = param.pos,
-                        },
+                        .pos = .{ .file = state.file_id, .offset = param.pos },
                         .severity = .err,
                         .data = .{ .duplicate_decl = .{
                             .original_pos = .{

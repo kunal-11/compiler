@@ -9,6 +9,8 @@ const Type = @import("types.zig").Type;
 const Func = @import("types.zig").Func;
 const Namespace = @import("types.zig").Namespace;
 const Constant = @import("types.zig").Constant;
+const InternPool = @import("types.zig").InternPool;
+const Symbol = @import("types.zig").Symbol;
 
 const TypedIr = @import("types.zig").TypedIr;
 const UntypedIr = @import("types.zig").UntypedIr;
@@ -79,7 +81,24 @@ pub const State = struct {
         return lower;
     }
 
-    pub fn emit(lower: *State, inst: TypedIr.Inst) TypedIr.InstId {
+    const Name = union(enum) {
+        none,
+        symbol: Symbol.Id,
+        type: Type.Id,
+    };
+
+    fn resolveName(state: *State, intern_id: InternPool.Id) Name {
+        const symbol = state.namespace.find(intern_id);
+        if (symbol != .none) return .{ .symbol = symbol };
+
+        const name_str = state.ctx.intern_pool.getString(intern_id);
+        const t = state.ctx.type_pool.parseLiteral(name_str);
+        if (t != .none) return .{ .type = t };
+
+        return .none;
+    }
+
+    fn emit(lower: *State, inst: TypedIr.Inst) TypedIr.InstId {
         const inst_id = lower.typed_ir.allocInst(inst);
         lower.insts[lower.inst_count] = inst_id;
         lower.inst_count += 1;
@@ -136,14 +155,14 @@ pub const State = struct {
             .known => |known| {
                 if (known.type == t_id) return val;
 
-                if (known.type == .comp_int) {
-                    // TODO: bounds check
-                    switch (t_id) {
-                        .u8, .u16, .u32, .u64, .usize, .i8, .i16, .i32, .i64, .isize => {
+                const t = state.ctx.type_pool.getType(t_id);
+                switch (known.type) {
+                    .comp_int => {
+                        if (t == .fixed_int) {
                             return .{ .known = .{ .type = t_id, .val = known.val } };
-                        },
-                        else => {},
-                    }
+                        }
+                    },
+                    else => {},
                 }
                 return error.IncompatibleTypes;
             },
@@ -191,11 +210,6 @@ pub fn lowerInst(state: *State, inst_id: UntypedIr.InstId, mode: Mode) Result {
 
         .fn_type => lowerFnType(state, inst_id),
         .num_lit => lowerNumLit(state, inst_id),
-
-        .type_lit => .{ .value = .{ .known = .{
-            .type = .type_id,
-            .val = .{ .type = inst.data.type_lit },
-        } } },
 
         .undef_lit => .{ .value = .{ .known = .{
             .type = .comp_undef,
@@ -263,7 +277,40 @@ pub fn lowerInst(state: *State, inst_id: UntypedIr.InstId, mode: Mode) Result {
 
         .add, .subtract, .mul, .div, .mod => lowerInfixOp(state, inst_id, mode),
 
-        .global_ptr, .global_val => @panic("TODO: global name resolve"),
+        .global_ptr => @panic("TODO: global ptr resolve"),
+
+        .global_val => blk: {
+            const name = state.resolveName(inst.data.global_ref);
+            switch (name) {
+                .none => {
+                    state.ctx.addMsg(.{
+                        .severity = .err,
+                        .pos = .{ .file = state.file_id, .offset = inst.pos },
+                        .data = .undeclared_identifier,
+                    });
+                    break :blk .{ .value = .poison };
+                },
+                .type => |t| break :blk .{ .value = .{ .known = .{
+                    .type = .type_id,
+                    .val = .{ .type = t },
+                } } },
+                .symbol => |symbol_id| {
+                    // TODO: emit a load and error in exec in case of variable
+
+                    // TODO: check if already evaled and reuse value
+                    const symbol = state.ctx.symbol_table.get(symbol_id);
+                    const child_state = evalBlock(
+                        state.ctx,
+                        state.arena,
+                        symbol.file,
+                        symbol.value_inst,
+                    );
+                    const child_value = child_state.getOperand(symbol.value_inst) orelse
+                        break :blk .{ .value = .poison };
+                    break :blk .{ .value = child_value };
+                },
+            }
+        },
 
         .ret_implicit => switch (mode) {
             .emit => blk: {
@@ -387,7 +434,7 @@ fn lowerAlloc(state: *State, inst_id: UntypedIr.InstId, mode: Mode) Result {
         return .{ .value = .poison };
     };
     switch (type_id) {
-        .comp_float, .comp_int, .comp_undef => {
+        .comp_float, .comp_int, .comp_undef, .type_id, .void, .noreturn => {
             state.ctx.addMsg(.{
                 .pos = .{ .file = state.file_id, .offset = inst.pos },
                 .severity = .err,

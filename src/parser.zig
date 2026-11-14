@@ -134,14 +134,6 @@ pub fn parseFile(ctx: *Context, arena: *mem.Arena, file_id: File.Id) Ast.NodeId 
 fn parseDecl(state: *State) ParseError!Ast.NodeId {
     const identifier = try expect(state, .identifier);
     const str = state.tokens.str(identifier);
-    if (Type.fromStr(str)) |type_lit| {
-        state.ctx.addMsg(.{
-            .severity = .err,
-            .pos = .{ .file = state.file_id, .offset = identifier.start },
-            .data = .{ .name_shadows_type = type_lit },
-        });
-        return error.IntrinsicShadowing;
-    }
     _ = try expect(state, .colon);
 
     const type_node = switch (state.tokens.peek().tag) {
@@ -310,14 +302,6 @@ fn parseFnType(state: *State) ParseError!Ast.NodeId {
 fn parseFnArg(state: *State) ParseError!Ast.NodeId {
     const identifier = try expect(state, .identifier);
     const str = state.tokens.str(identifier);
-    if (Type.fromStr(str)) |type_lit| {
-        state.ctx.addMsg(.{
-            .severity = .err,
-            .pos = .{ .file = state.file_id, .offset = identifier.start },
-            .data = .{ .name_shadows_type = type_lit },
-        });
-        return error.IntrinsicShadowing;
-    }
     _ = try expect(state, .colon);
 
     const type_node = parseType(state) catch .poison;
@@ -468,13 +452,6 @@ fn parseBoolLit(state: *State) Ast.NodeId {
 fn parseIdentifier(state: *State) ParseError!Ast.NodeId {
     const token = try expect(state, .identifier);
     const str = state.tokens.str(token);
-    if (Type.fromStr(str)) |type_lit| {
-        return state.ast.allocNode(.{
-            .pos = token.start,
-            .tag = .type_lit,
-            .data = .{ .type_lit = type_lit },
-        });
-    }
     const intern_id = state.ctx.intern_pool.getOrCreateId(str);
     return state.ast.allocNode(.{
         .pos = token.start,
