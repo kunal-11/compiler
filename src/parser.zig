@@ -6,9 +6,98 @@ const lexer = @import("lexer.zig");
 
 const Context = @import("types.zig").Context;
 const File = @import("types.zig").File;
-const Ast = @import("types.zig").Ast;
 const InternPool = @import("types.zig").InternPool;
 const Type = @import("types.zig").Type;
+
+pub const Ast = struct {
+    pub const Tag = enum(u32) {
+        file,
+
+        identifier,
+
+        bool_lit,
+        undef_lit,
+        num_lit,
+
+        fn_type,
+        fn_lit,
+
+        block,
+        params,
+        param,
+
+        const_decl,
+        var_decl,
+        negate,
+
+        ret,
+
+        add,
+        subtract,
+        mul,
+        div,
+        mod,
+        assign,
+    };
+
+    pub const List = struct { offset: u32, count: u32 };
+
+    pub const Node = struct {
+        pos: u32,
+        tag: Tag,
+        data: union {
+            block: List,
+
+            identifier: struct { intern_id: InternPool.Id },
+
+            bool_lit: bool,
+
+            fn_type: struct { args: NodeId, return_type: NodeId },
+            fn_lit: struct { fn_type: NodeId, block: NodeId },
+
+            param: struct { intern_id: InternPool.Id, type: NodeId },
+            decl: struct { param: NodeId, value: NodeId },
+
+            unary_op: NodeId,
+            bin_op: struct { lhs: NodeId, rhs: NodeId },
+
+            empty: void,
+        },
+    };
+
+    pub fn allocNode(ast: *Ast, node: Node) NodeId {
+        const result = ast.node_count;
+        ast.nodes[result] = node;
+        ast.node_count += 1;
+        return @fromBackingInt(result);
+    }
+
+    pub fn getNode(ast: *Ast, id: NodeId) Node {
+        debug.assert(id != .none, "get none ast node");
+        debug.assert(id != .poison, "get poison ast node");
+        return ast.nodes[@backingInt(id)];
+    }
+
+    pub fn allocList(ast: *Ast, ids: []NodeId) List {
+        const offset = ast.extra_count;
+        for (ids) |id| {
+            ast.extras[ast.extra_count] = id;
+            ast.extra_count += 1;
+        }
+        return .{ .offset = offset, .count = @intCast(ids.len) };
+    }
+
+    pub const NodeId = enum(u32) { none = 0, poison = 1, _ };
+
+    const max_nodes = 8192;
+    const max_extras = 4096;
+
+    nodes: [max_nodes]Node = undefined,
+    node_count: u32 = 2,
+
+    extras: [max_extras]NodeId = undefined,
+    extra_count: u32 = 0,
+};
 
 const TokenCache = struct {
     buf: []const u8,

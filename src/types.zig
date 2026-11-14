@@ -4,9 +4,11 @@ const math = stdx.math;
 const debug = stdx.debug;
 
 const lexer = @import("lexer.zig");
+const Ast = @import("parser.zig").Ast;
 const analyzer = @import("analyzer.zig");
 
-const typed_lower = @import("lower_typed.zig");
+const untyped = @import("untyped.zig");
+const typed = @import("typed.zig");
 
 pub const Message = struct {
     pub const Severity = enum { info, warn, err };
@@ -23,10 +25,8 @@ pub const Message = struct {
         expected_binding_op,
         expected_expression,
         expected_type,
-        expected_lvalue,
-
+        expected_ptr,
         undeclared_identifier,
-        exptected_ptr,
         addr_of_comp_type,
         incompatible_peer_types,
         incompatible_cast,
@@ -143,8 +143,8 @@ pub const File = struct {
     contents: []const u8,
 
     ast: *Ast,
-    untyped_ir: *UntypedIr,
-    typed_ir: *TypedIr,
+    untyped_ir: *untyped.Ir,
+    typed_ir: *typed.Ir,
 
     namespace_id: Namespace.Id,
 };
@@ -223,274 +223,10 @@ pub const Symbol = struct {
 
     file: File.Id,
     pos: u32,
-    value_inst: UntypedIr.InstId,
+    value_inst: untyped.Ir.InstId,
 
     tag: enum { variable, constant },
     status: enum { unchecked, checked, check_failed },
-};
-
-pub const Ast = struct {
-    pub const Tag = enum(u32) {
-        file,
-
-        identifier,
-
-        bool_lit,
-        undef_lit,
-        num_lit,
-
-        fn_type,
-        fn_lit,
-
-        block,
-        params,
-        param,
-
-        const_decl,
-        var_decl,
-        negate,
-
-        ret,
-
-        add,
-        subtract,
-        mul,
-        div,
-        mod,
-        assign,
-    };
-
-    pub const List = struct { offset: u32, count: u32 };
-
-    pub const Node = struct {
-        pos: u32,
-        tag: Tag,
-        data: union {
-            block: List,
-
-            identifier: struct { intern_id: InternPool.Id },
-
-            bool_lit: bool,
-
-            fn_type: struct { args: NodeId, return_type: NodeId },
-            fn_lit: struct { fn_type: NodeId, block: NodeId },
-
-            param: struct { intern_id: InternPool.Id, type: NodeId },
-            decl: struct { param: NodeId, value: NodeId },
-
-            unary_op: NodeId,
-            bin_op: struct { lhs: NodeId, rhs: NodeId },
-
-            empty: void,
-        },
-    };
-
-    pub fn allocNode(ast: *Ast, node: Node) NodeId {
-        const result = ast.node_count;
-        ast.nodes[result] = node;
-        ast.node_count += 1;
-        return @fromBackingInt(result);
-    }
-
-    pub fn getNode(ast: *Ast, id: NodeId) Node {
-        debug.assert(id != .none, "get none ast node");
-        debug.assert(id != .poison, "get poison ast node");
-        return ast.nodes[@backingInt(id)];
-    }
-
-    pub fn allocList(ast: *Ast, ids: []NodeId) List {
-        const offset = ast.extra_count;
-        for (ids) |id| {
-            ast.extras[ast.extra_count] = id;
-            ast.extra_count += 1;
-        }
-        return .{ .offset = offset, .count = @intCast(ids.len) };
-    }
-
-    pub const NodeId = enum(u32) { none = 0, poison = 1, _ };
-
-    const max_nodes = 8192;
-    const max_extras = 4096;
-
-    nodes: [max_nodes]Node = undefined,
-    node_count: u32 = 2,
-
-    extras: [max_extras]NodeId = undefined,
-    extra_count: u32 = 0,
-};
-
-pub const UntypedIr = struct {
-    pub const Tag = enum(u32) {
-        reserved,
-
-        comp_block,
-        block,
-
-        brk, // bin_op - block_id, value
-        brk_implicit, // unary_op - block_id
-
-        ret, // unary_op - value
-        ret_implicit, // empty
-
-        coerce_type, // lhs - type inst, rhs - value
-        type_of,
-
-        global_ptr,
-        global_val,
-
-        num_lit,
-        bool_lit,
-        undef_lit,
-
-        alloc,
-        store,
-        load,
-
-        fn_lit,
-        fn_arg,
-        fn_type,
-
-        add,
-        subtract,
-        mul,
-        div,
-        mod,
-
-        negate,
-    };
-
-    pub const List = struct {
-        offset: u32,
-        count: u32,
-    };
-
-    pub const Inst = struct {
-        pos: u32,
-        tag: Tag,
-        data: union {
-            empty: void,
-            block: List,
-
-            bool_lit: bool,
-
-            global_ref: InternPool.Id,
-
-            fn_arg: struct { index: u32 },
-            fn_lit: struct { type: InstId, body: List },
-            fn_type: struct { return_type: InstId, arg_types: List },
-
-            bin_op: struct { lhs: InstId, rhs: InstId },
-            unary_op: InstId,
-        },
-    };
-
-    pub const InstId = enum(u32) { none = 0, poison = 1, _ };
-
-    const max_insts = 8192;
-    const max_extras = 8192;
-
-    insts: [max_insts]Inst = undefined,
-    inst_count: u32 = 2,
-
-    extras: [max_extras]InstId = undefined,
-    extra_count: u32 = 0,
-
-    pub fn getInst(ir: *UntypedIr, id: InstId) Inst {
-        debug.assert(id != .none, "get none untyped inst");
-        debug.assert(id != .poison, "get poison untyped inst");
-        return ir.insts[@backingInt(id)];
-    }
-
-    pub fn overwriteInst(ir: *UntypedIr, id: InstId, inst: Inst) void {
-        ir.insts[@backingInt(id)] = inst;
-    }
-
-    pub fn allocInst(ir: *UntypedIr, inst: Inst) InstId {
-        const result = ir.inst_count;
-        ir.insts[result] = inst;
-        ir.inst_count += 1;
-        return @fromBackingInt(result);
-    }
-
-    pub fn allocList(ir: *UntypedIr, ids: []InstId) List {
-        const offset = ir.extra_count;
-        for (ids) |id| {
-            ir.extras[ir.extra_count] = id;
-            ir.extra_count += 1;
-        }
-        return .{ .offset = offset, .count = @intCast(ids.len) };
-    }
-};
-
-pub const TypedIr = struct {
-    pub const Tag = enum(u32) {
-        constant,
-
-        add,
-        subtract,
-        mul,
-        div,
-        mod,
-
-        alloc,
-        load,
-        store,
-
-        ret,
-
-        func,
-    };
-
-    pub const InstId = enum(u32) { none = 0, _ };
-
-    pub const Inst = struct {
-        pos: u32,
-        tag: Tag,
-        type: Type.Id,
-        data: union {
-            arg: struct { index: u32, type: Type.Id },
-            bin_op: struct { lhs: InstId, rhs: InstId },
-            unary_op: InstId,
-            alloc: Type.Id,
-            constant: Constant.Id,
-            block: List,
-        },
-    };
-
-    const max_insts = 8192;
-    const max_extras = 4096;
-
-    insts: [max_insts]Inst = undefined,
-    inst_count: u32 = 1,
-
-    extras: [max_extras]InstId = undefined,
-    extra_count: u32 = 0,
-
-    pub const List = struct {
-        offset: u32,
-        count: u32,
-    };
-
-    pub fn getInst(ir: *TypedIr, id: InstId) Inst {
-        debug.assert(id != .none, "get none typed inst");
-        return ir.insts[@backingInt(id)];
-    }
-
-    pub fn allocInst(ir: *TypedIr, inst: Inst) InstId {
-        const result = ir.inst_count;
-        ir.insts[result] = inst;
-        ir.inst_count += 1;
-        return @fromBackingInt(result);
-    }
-
-    pub fn allocList(ir: *TypedIr, ids: []InstId) List {
-        const offset = ir.extra_count;
-        for (ids) |id| {
-            ir.extras[ir.extra_count] = id;
-            ir.extra_count += 1;
-        }
-        return .{ .offset = offset, .count = @intCast(ids.len) };
-    }
 };
 
 pub const Type = union(enum) {
@@ -795,11 +531,11 @@ pub const Func = struct {
 
     type: Type.Id,
     file: File.Id,
-    untyped_inst: UntypedIr.InstId,
+    untyped_inst: untyped.Ir.InstId,
     status: union(enum) {
         unchecked,
-        queued: *typed_lower.State,
-        checked: TypedIr.InstId,
+        queued: *typed.State,
+        checked: typed.Ir.InstId,
     },
 
     pub const Table = struct {

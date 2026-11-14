@@ -1,16 +1,16 @@
 const stdx = @import("stdx.zig");
 const debug = stdx.debug;
 
-const Ast = @import("types.zig").Ast;
 const Context = @import("types.zig").Context;
 const File = @import("types.zig").File;
-const UntypedIr = @import("types.zig").UntypedIr;
-const TypedIr = @import("types.zig").TypedIr;
 const Type = @import("types.zig").Type;
 const Constant = @import("types.zig").Constant;
 const InternPool = @import("types.zig").InternPool;
 
 const lexer = @import("lexer.zig");
+const Ast = @import("parser.zig").Ast;
+const UntypedIr = @import("untyped.zig").Ir;
+const TypedIr = @import("typed.zig").Ir;
 
 pub fn debugPrintMessages(ctx: *Context) void {
     debug.print("Messages:\n", .{});

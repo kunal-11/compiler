@@ -8,15 +8,13 @@ const test_module = "testdir/mod1";
 const test_file = test_module ++ "/main.pnx";
 
 const Context = @import("types.zig").Context;
-const Ast = @import("types.zig").Ast;
-const UntypedIr = @import("types.zig").UntypedIr;
-const TypedIr = @import("types.zig").TypedIr;
 const File = @import("types.zig").File;
 const Namespace = @import("types.zig").Namespace;
 const Symbol = @import("types.zig").Symbol;
 
 const parser = @import("parser.zig");
-const untyped_lower = @import("lower_untyped.zig");
+const untyped = @import("untyped.zig");
+const typed = @import("typed.zig");
 const printer = @import("printer.zig");
 const analyzer = @import("analyzer.zig");
 
@@ -69,13 +67,13 @@ fn loadFile(ctx: *Context, arena: *mem.Arena, ns_id: Namespace.Id, path: []const
         "file read incorrect size",
     );
 
-    const ast = file_arena.pushStruct(Ast);
+    const ast = file_arena.pushStruct(parser.Ast);
     ast.* = .{};
 
-    const untyped_ir = file_arena.pushStruct(UntypedIr);
+    const untyped_ir = file_arena.pushStruct(untyped.Ir);
     untyped_ir.* = .{};
 
-    const typed_ir = file_arena.pushStruct(TypedIr);
+    const typed_ir = file_arena.pushStruct(typed.Ir);
     typed_ir.* = .{};
 
     const ns = ctx.getNamespace(ns_id);
@@ -92,7 +90,7 @@ fn loadFile(ctx: *Context, arena: *mem.Arena, ns_id: Namespace.Id, path: []const
     const root_node = parser.parseFile(ctx, arena, file_id);
     printer.debugPrintAst(file_buf, ast, root_node, 0, true);
 
-    const decls = untyped_lower.lowerFile(ctx, arena, file_id, root_node);
+    const decls = untyped.lowerFile(ctx, arena, file_id, root_node);
     for (decls) |decl| {
         debug.print("Decl: {s} {s}\n", .{
             ctx.intern_pool.getString(decl.name),

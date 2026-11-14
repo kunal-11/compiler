@@ -3,11 +3,114 @@ const mem = stdx.mem;
 const debug = stdx.debug;
 
 const Context = @import("types.zig").Context;
-const Ast = @import("types.zig").Ast;
 const File = @import("types.zig").File;
-const Ir = @import("types.zig").UntypedIr;
 const InternPool = @import("types.zig").InternPool;
 const Type = @import("types.zig").Type;
+
+const Ast = @import("parser.zig").Ast;
+
+pub const Ir = struct {
+    pub const Tag = enum(u32) {
+        reserved,
+
+        comp_block,
+        block,
+
+        brk, // bin_op - block_id, value
+        brk_implicit, // unary_op - block_id
+
+        ret, // unary_op - value
+        ret_implicit, // empty
+
+        coerce_type, // lhs - type inst, rhs - value
+        type_of,
+
+        global_ptr,
+        global_val,
+
+        num_lit,
+        bool_lit,
+        undef_lit,
+
+        alloc,
+        store,
+        load,
+
+        fn_lit,
+        fn_arg,
+        fn_type,
+
+        add,
+        subtract,
+        mul,
+        div,
+        mod,
+
+        negate,
+    };
+
+    pub const List = struct {
+        offset: u32,
+        count: u32,
+    };
+
+    pub const Inst = struct {
+        pos: u32,
+        tag: Tag,
+        data: union {
+            empty: void,
+            block: List,
+
+            bool_lit: bool,
+
+            global_ref: InternPool.Id,
+
+            fn_arg: struct { index: u32 },
+            fn_lit: struct { type: InstId, body: List },
+            fn_type: struct { return_type: InstId, arg_types: List },
+
+            bin_op: struct { lhs: InstId, rhs: InstId },
+            unary_op: InstId,
+        },
+    };
+
+    pub const InstId = enum(u32) { none = 0, poison = 1, _ };
+
+    const max_insts = 8192;
+    const max_extras = 8192;
+
+    insts: [max_insts]Inst = undefined,
+    inst_count: u32 = 2,
+
+    extras: [max_extras]InstId = undefined,
+    extra_count: u32 = 0,
+
+    pub fn getInst(ir: *Ir, id: InstId) Inst {
+        debug.assert(id != .none, "get none untyped inst");
+        debug.assert(id != .poison, "get poison untyped inst");
+        return ir.insts[@backingInt(id)];
+    }
+
+    pub fn overwriteInst(ir: *Ir, id: InstId, inst: Inst) void {
+        ir.insts[@backingInt(id)] = inst;
+    }
+
+    pub fn allocInst(ir: *Ir, inst: Inst) InstId {
+        const result = ir.inst_count;
+        ir.insts[result] = inst;
+        ir.inst_count += 1;
+        return @fromBackingInt(result);
+    }
+
+    pub fn allocList(ir: *Ir, ids: []InstId) List {
+        const offset = ir.extra_count;
+        for (ids) |id| {
+            ir.extras[ir.extra_count] = id;
+            ir.extra_count += 1;
+        }
+        return .{ .offset = offset, .count = @intCast(ids.len) };
+    }
+};
 
 const State = struct {
     const max_instructions = 4096;
@@ -402,7 +505,7 @@ fn lowerPtr(state: *State, node_id: Ast.NodeId) Ir.InstId {
                             state.ctx.addMsg(.{
                                 .severity = .err,
                                 .pos = .{ .file = state.file_id, .offset = node.pos },
-                                .data = .expected_lvalue,
+                                .data = .expected_ptr,
                             });
                             break :blk1 .poison;
                         },
@@ -416,7 +519,7 @@ fn lowerPtr(state: *State, node_id: Ast.NodeId) Ir.InstId {
             state.ctx.addMsg(.{
                 .severity = .err,
                 .pos = .{ .file = state.file_id, .offset = node.pos },
-                .data = .expected_lvalue,
+                .data = .expected_ptr,
             });
             break :blk1 .poison;
         },

@@ -12,10 +12,79 @@ const Constant = @import("types.zig").Constant;
 const InternPool = @import("types.zig").InternPool;
 const Symbol = @import("types.zig").Symbol;
 
-const TypedIr = @import("types.zig").TypedIr;
-const UntypedIr = @import("types.zig").UntypedIr;
-
+const UntypedIr = @import("untyped.zig").Ir;
 const lexer = @import("lexer.zig");
+
+pub const Ir = struct {
+    pub const Tag = enum(u32) {
+        constant,
+
+        add,
+        subtract,
+        mul,
+        div,
+        mod,
+
+        alloc,
+        load,
+        store,
+
+        ret,
+
+        func,
+    };
+
+    pub const InstId = enum(u32) { none = 0, _ };
+
+    pub const Inst = struct {
+        pos: u32,
+        tag: Tag,
+        type: Type.Id,
+        data: union {
+            arg: struct { index: u32, type: Type.Id },
+            bin_op: struct { lhs: InstId, rhs: InstId },
+            unary_op: InstId,
+            alloc: Type.Id,
+            constant: Constant.Id,
+            block: List,
+        },
+    };
+
+    const max_insts = 8192;
+    const max_extras = 4096;
+
+    insts: [max_insts]Inst = undefined,
+    inst_count: u32 = 1,
+
+    extras: [max_extras]InstId = undefined,
+    extra_count: u32 = 0,
+
+    pub const List = struct {
+        offset: u32,
+        count: u32,
+    };
+
+    pub fn getInst(ir: *Ir, id: InstId) Inst {
+        debug.assert(id != .none, "get none typed inst");
+        return ir.insts[@backingInt(id)];
+    }
+
+    pub fn allocInst(ir: *Ir, inst: Inst) InstId {
+        const result = ir.inst_count;
+        ir.insts[result] = inst;
+        ir.inst_count += 1;
+        return @fromBackingInt(result);
+    }
+
+    pub fn allocList(ir: *Ir, ids: []InstId) List {
+        const offset = ir.extra_count;
+        for (ids) |id| {
+            ir.extras[ir.extra_count] = id;
+            ir.extra_count += 1;
+        }
+        return .{ .offset = offset, .count = @intCast(ids.len) };
+    }
+};
 
 pub const Known = struct {
     type: Type.Id,
@@ -33,7 +102,7 @@ const Value = union(enum) {
     none,
     poison,
     known: Known,
-    runtime: TypedIr.InstId,
+    runtime: Ir.InstId,
 
     fn expectType(value: Value) !Type.Id {
         return switch (value) {
@@ -54,12 +123,12 @@ pub const State = struct {
     file_id: File.Id,
 
     untyped_ir: *UntypedIr,
-    typed_ir: *TypedIr,
+    typed_ir: *Ir,
     namespace: *Namespace,
 
     results: []Value,
 
-    insts: [max_insts]TypedIr.InstId = undefined,
+    insts: [max_insts]Ir.InstId = undefined,
     inst_count: u32 = 0,
 
     const max_insts = 2048;
@@ -98,7 +167,7 @@ pub const State = struct {
         return .none;
     }
 
-    fn emit(lower: *State, inst: TypedIr.Inst) TypedIr.InstId {
+    fn emit(lower: *State, inst: Ir.Inst) Ir.InstId {
         const inst_id = lower.typed_ir.allocInst(inst);
         lower.insts[lower.inst_count] = inst_id;
         lower.inst_count += 1;
@@ -125,7 +194,7 @@ pub const State = struct {
         };
     }
 
-    fn ref(lower: *State, val: Value) TypedIr.InstId {
+    fn ref(lower: *State, val: Value) Ir.InstId {
         return switch (val) {
             .known => |value| blk: {
                 const const_id: Constant.Id = switch (value.val) {
@@ -370,7 +439,7 @@ fn lowerStore(state: *State, inst_id: UntypedIr.InstId, mode: Mode) Result {
         state.ctx.addMsg(.{
             .severity = .err,
             .pos = .{ .file = state.file_id, .offset = inst.pos },
-            .data = .exptected_ptr,
+            .data = .expected_ptr,
         });
         return .{ .value = .poison };
     }

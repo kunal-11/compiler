@@ -7,7 +7,7 @@ const Context = @import("types.zig").Context;
 const Symbol = @import("types.zig").Symbol;
 const Func = @import("types.zig").Func;
 
-const typed_lower = @import("lower_typed.zig");
+const typed = @import("typed.zig");
 const lexer = @import("lexer.zig");
 
 pub const Queue = struct {
@@ -47,7 +47,7 @@ pub fn analyze(ctx: *Context, arena: *mem.Arena) void {
                 const symbol = ctx.symbol_table.get(decl);
                 const file = ctx.getFile(symbol.file);
 
-                const state = typed_lower.evalBlock(ctx, arena, symbol.file, symbol.value_inst);
+                const state = typed.evalBlock(ctx, arena, symbol.file, symbol.value_inst);
                 const result = state.results[@backingInt(symbol.value_inst)];
 
                 if (result == .poison) {
@@ -75,7 +75,7 @@ pub fn analyze(ctx: *Context, arena: *mem.Arena) void {
                 const func = ctx.func_table.get(lit);
                 debug.assert(func.status == .queued, "fn check item invalid status");
 
-                const jump = typed_lower.lowerInst(func.status.queued, func.untyped_inst, .emit);
+                const jump = typed.lowerInst(func.status.queued, func.untyped_inst, .emit);
                 debug.assert(jump.control == .none, "jump on emit mode lower");
                 const fn_inst = func.status.queued.results[@backingInt(func.untyped_inst)].runtime;
                 func.status = .{ .checked = fn_inst };
